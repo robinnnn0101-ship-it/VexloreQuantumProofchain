@@ -2,24 +2,33 @@
 """Non-interactive demo of Vexlore Quantumproof Chain (v0.4 WALLET UPGRADES)."""
 
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "dilithium_src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
+import vexlore_chain as chain_module
 from vexlore_chain import (
     VexloreChain, Wallet, NodeServer, print_banner, VERSION, validate_mnemonic,
 )
 
 def main():
+    with tempfile.TemporaryDirectory(prefix="vexlore-demo-") as temporary_directory:
+        demo_dir = Path(temporary_directory)
+        chain_module.DATA_DIR = demo_dir / "data"
+        chain_module.CHAIN_FILE = chain_module.DATA_DIR / "vexlore_chain.json"
+        chain_module.PEERS_FILE = chain_module.DATA_DIR / "peers.json"
+        chain_module.WALLETS_DIR = demo_dir / "wallet"
+        chain_module.DATA_DIR.mkdir()
+        chain_module.WALLETS_DIR.mkdir()
+        _run_demo()
+
+
+def _run_demo():
     print_banner()
     print(f"=== Running automatic demo (v{VERSION}) ===\n")
-
-    for name in ("demo_alice", "demo_bob", "demo_alice_restored"):
-        p = Path(__file__).parent / "wallet" / f"{name}.json"
-        if p.exists():
-            p.unlink()
 
     chain = VexloreChain()
 
@@ -34,11 +43,11 @@ def main():
     alice.new_address()
     print(f"Alice now has {len(alice.addresses)} addresses")
 
-    chain.faucet(alice.address, 100)
+    # The only issuance is the fixed block reward.
     chain.mine_pending(alice.address)
-    print(f"\nAlice balance after faucet+mine: {chain.get_balance(alice.address)} VEX")
+    print(f"\nAlice balance after mining: {chain.get_balance(alice.address)} VEX")
 
-    tx = alice.create_transaction(bob.address, 25.5, memo="Hello from quantum-safe Vexlore")
+    tx = alice.create_transaction(bob.address, 2.5, memo="Hello from quantum-safe Vexlore")
     chain.add_transaction(tx)
     alice.record_history(tx, "out")
     chain.mine_pending(alice.address)

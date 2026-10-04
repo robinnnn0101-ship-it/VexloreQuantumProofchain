@@ -13,9 +13,12 @@ Not production-ready — for learning and experimentation only.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import math
 import os
 import secrets
+import shutil
 import socket
 import sys
 import tempfile
@@ -26,7 +29,7 @@ from dataclasses import dataclass, asdict
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 try:
     import requests
@@ -47,8 +50,8 @@ sys.path.insert(0, str(Path(__file__).parent / "dilithium_src"))
 try:
     from dilithium_py.ml_dsa import ML_DSA_44  # type: ignore
 except ImportError:
-    print("[-] dilithium_src not found. Place the pure-Python ML-DSA package next to this file.")
-    print("    Expected: dilithium_src/dilithium_py/ml_dsa.py")
+    print("[-] ML-DSA dependency not found.")
+    print("    Install project dependencies with: python -m pip install -r requirements.txt")
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
@@ -63,6 +66,8 @@ DIFFICULTY_ADJUST_EVERY = 5
 MIN_DIFFICULTY = 2
 MAX_DIFFICULTY = 6
 MAX_TX_PER_BLOCK = 50
+BLOCK_REWARD = 10.0
+GENESIS_TIMESTAMP = 0.0
 DEFAULT_PORT = 5000
 SYNC_INTERVAL = 15
 MNEMONIC_WORDS = 12
@@ -337,7 +342,10 @@ class Transaction:
 
     def verify(self) -> bool:
         try:
-            return pq_verify(bytes.fromhex(self.public_key), self.message_to_sign(), bytes.fromhex(self.signature))
+            public_key = bytes.fromhex(self.public_key)
+            if address_from_pubkey(public_key) != self.sender:
+                return False
+            return pq_verify(public_key, self.message_to_sign(), bytes.fromhex(self.signature))
         except Exception:
             return False
 
@@ -380,6 +388,30 @@ class Block:
         return cls(index=d["index"], timestamp=d["timestamp"], transactions=txs,
                    previous_hash=d["previous_hash"], difficulty=d.get("difficulty", INITIAL_DIFFICULTY),
                    nonce=d.get("nonce", 0), hash=d.get("hash", ""), miner=d.get("miner", ""))
+
+
+def canonical_genesis_block() -> Block:
+    transaction = Transaction(
+        tx_id="genesis",
+        sender="VEXLORE_NETWORK",
+        recipient="VEXLORE_NETWORK",
+        amount=0.0,
+        timestamp=GENESIS_TIMESTAMP,
+        public_key="",
+        signature="",
+        memo="Genesis of Vexlore – Quantumproof by design",
+    )
+    block = Block(
+        index=0,
+        timestamp=GENESIS_TIMESTAMP,
+        transactions=[transaction],
+        previous_hash="0" * 64,
+        difficulty=INITIAL_DIFFICULTY,
+        miner="genesis",
+    )
+    block.hash = block.compute_hash()
+    return block
+
 
 class Wallet:
     def __init__(self, name: str = "default", password: Optional[str] = None):
@@ -583,23 +615,42 @@ class VexloreChain:
             try:
                 raw = json.loads(CHAIN_FILE.read_text())
                 self.chain = [Block.from_dict(b) for b in raw["chain"]]
-                self.balances = raw.get("balances", {})
-                self.current_difficulty = raw.get("difficulty", INITIAL_DIFFICULTY)
+                if not self.is_valid():
+                    raise ValueError("stored chain fails current consensus validation")
+                self.balances = {}
+                known_ids = {
+                    tx.tx_id
+                    for tx in self.chain[0].transactions
+                    if isinstance(tx, Transaction) and isinstance(tx.tx_id, str)
+                }
+                for block in self.chain[1:]:
+                    balances = self._replay_block(
+                        block, self.chain[:block.index], self.balances, known_ids
+                    )
+                    if balances is None:
+                        raise ValueError("stored chain fails transaction validation")
+                    self.balances = balances
+                    known_ids.update(tx.tx_id for tx in block.transactions)
+                self.current_difficulty = self.chain[-1].difficulty
                 print(f"[+] Loaded chain with {len(self.chain)} blocks (diff={self.current_difficulty})")
             except Exception as e:
                 print(f"[!] Failed to load chain: {e}")
+                if CHAIN_FILE.exists():
+                    backup = CHAIN_FILE.with_name(
+                        f"{CHAIN_FILE.name}.invalid-{time.time_ns()}"
+                    )
+                    shutil.copy2(CHAIN_FILE, backup)
+                    print(f"[!] Preserved rejected chain at {backup}")
                 self._create_genesis()
         else:
             self._create_genesis()
 
     def _create_genesis(self) -> None:
         print("[*] Creating Genesis block of Vexlore Quantumproof Chain ...")
-        genesis_tx = Transaction(tx_id="genesis", sender="VEXLORE_NETWORK", recipient="VEXLORE_NETWORK",
-                                 amount=0.0, timestamp=time.time(), public_key="", signature="",
-                                 memo="Genesis of Vexlore – Quantumproof by design")
-        block = Block(index=0, timestamp=time.time(), transactions=[genesis_tx],
-                      previous_hash="0" * 64, difficulty=INITIAL_DIFFICULTY, miner="genesis")
-        block.hash = block.compute_hash()
+        self.chain = []
+        self.pending = []
+        self.balances = {}
+        block = canonical_genesis_block()
         self.chain.append(block)
         self.current_difficulty = INITIAL_DIFFICULTY
         self._save()
@@ -626,30 +677,136 @@ class VexloreChain:
     def last_block(self) -> Block:
         return self.chain[-1]
 
-    def _adjust_difficulty(self) -> int:
-        if len(self.chain) < DIFFICULTY_ADJUST_EVERY + 1:
-            return self.current_difficulty
-        recent = self.chain[-DIFFICULTY_ADJUST_EVERY:]
+    @staticmethod
+    def _next_difficulty(blocks: List[Block]) -> int:
+        difficulty = blocks[-1].difficulty
+        if len(blocks) < DIFFICULTY_ADJUST_EVERY + 1:
+            return difficulty
+        recent = blocks[-DIFFICULTY_ADJUST_EVERY:]
         time_taken = recent[-1].timestamp - recent[0].timestamp
         expected = TARGET_BLOCK_TIME * (DIFFICULTY_ADJUST_EVERY - 1)
-        new_diff = self.current_difficulty
         if time_taken < expected * 0.7:
-            new_diff = min(MAX_DIFFICULTY, self.current_difficulty + 1)
-        elif time_taken > expected * 1.4:
-            new_diff = max(MIN_DIFFICULTY, self.current_difficulty - 1)
-        if new_diff != self.current_difficulty:
-            print(f"[*] Difficulty adjusted: {self.current_difficulty} → {new_diff}")
-        return new_diff
+            return min(MAX_DIFFICULTY, difficulty + 1)
+        if time_taken > expected * 1.4:
+            return max(MIN_DIFFICULTY, difficulty - 1)
+        return difficulty
+
+    def _adjust_difficulty(self) -> int:
+        difficulty = self._next_difficulty(self.chain)
+        if difficulty != self.current_difficulty:
+            print(f"[*] Difficulty adjusted: {self.current_difficulty} → {difficulty}")
+        return difficulty
+
+    @staticmethod
+    def _finite_number(value: Any) -> bool:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            return False
+
+    @classmethod
+    def _valid_amount(cls, amount: Any) -> bool:
+        return cls._finite_number(amount) and amount > 0
+
+    def _apply_user_transaction(
+        self, tx: Transaction, balances: Dict[str, float], known_ids: Set[str]
+    ) -> Optional[Dict[str, float]]:
+        if not isinstance(tx, Transaction) or not isinstance(tx.tx_id, str):
+            return None
+        if (
+            tx.sender == "VEXLORE_NETWORK"
+            or not tx.tx_id
+            or not isinstance(tx.sender, str)
+            or not isinstance(tx.recipient, str)
+            or not tx.sender
+            or not tx.recipient
+            or tx.tx_id in known_ids
+            or not self._finite_number(tx.timestamp)
+            or not self._valid_amount(tx.amount)
+            or not tx.verify()
+            or balances.get(tx.sender, 0.0) < tx.amount
+        ):
+            return None
+        updated = balances.copy()
+        updated[tx.sender] = updated.get(tx.sender, 0.0) - tx.amount
+        updated[tx.recipient] = updated.get(tx.recipient, 0.0) + tx.amount
+        return updated
+
+    def _replay_block(
+        self, block: Block, previous_blocks: List[Block],
+        balances: Dict[str, float], known_ids: Set[str]
+    ) -> Optional[Dict[str, float]]:
+        if (
+            not isinstance(block.difficulty, int)
+            or isinstance(block.difficulty, bool)
+            or not MIN_DIFFICULTY <= block.difficulty <= MAX_DIFFICULTY
+            or block.difficulty != self._next_difficulty(previous_blocks)
+            or not isinstance(block.nonce, int)
+            or isinstance(block.nonce, bool)
+            or block.nonce < 0
+            or not isinstance(block.miner, str)
+            or not block.miner
+            or not self._finite_number(block.timestamp)
+            or block.timestamp < previous_blocks[-1].timestamp
+            or not isinstance(block.hash, str)
+            or not isinstance(block.transactions, list)
+            or not 1 <= len(block.transactions) <= MAX_TX_PER_BLOCK + 1
+            or block.hash != block.compute_hash()
+            or not block.hash.startswith("0" * block.difficulty)
+        ):
+            return None
+
+        updated = balances.copy()
+        block_ids: Set[str] = set()
+        rewards = 0
+        for index, tx in enumerate(block.transactions):
+            if (
+                not isinstance(tx, Transaction)
+                or not isinstance(tx.tx_id, str)
+                or not tx.tx_id
+                or tx.tx_id in known_ids
+                or tx.tx_id in block_ids
+            ):
+                return None
+            if tx.sender == "VEXLORE_NETWORK":
+                if (
+                    index != len(block.transactions) - 1
+                    or tx.amount != BLOCK_REWARD
+                    or tx.recipient != block.miner
+                    or tx.memo != "Block reward"
+                    or not self._finite_number(tx.timestamp)
+                    or tx.public_key
+                    or tx.signature
+                ):
+                    return None
+                rewards += 1
+                updated[tx.recipient] = updated.get(tx.recipient, 0.0) + BLOCK_REWARD
+            else:
+                next_balances = self._apply_user_transaction(tx, updated, known_ids | block_ids)
+                if next_balances is None:
+                    return None
+                updated = next_balances
+            block_ids.add(tx.tx_id)
+        return updated if rewards == 1 else None
 
     def add_transaction(self, tx: Transaction) -> bool:
-        if not tx.verify() and tx.sender != "VEXLORE_NETWORK":
-            print("[-] Invalid quantum signature – transaction rejected")
-            return False
-        sender_bal = self.balances.get(tx.sender, 0.0)
-        if tx.sender != "VEXLORE_NETWORK" and sender_bal < tx.amount:
-            print(f"[-] Insufficient balance: {sender_bal} < {tx.amount}")
-            return False
-        if any(p.tx_id == tx.tx_id for p in self.pending):
+        known_ids = {
+            item.tx_id
+            for block in self.chain
+            for item in block.transactions
+            if isinstance(item.tx_id, str)
+        }
+        pending_balances = self.balances.copy()
+        pending_ids = set(known_ids)
+        for pending in self.pending:
+            next_balances = self._apply_user_transaction(pending, pending_balances, pending_ids)
+            if next_balances is not None:
+                pending_balances = next_balances
+                pending_ids.add(pending.tx_id)
+        if self._apply_user_transaction(tx, pending_balances, pending_ids) is None:
+            print("[-] Invalid or unfunded transaction – rejected")
             return False
         if len(self.pending) >= MAX_TX_PER_BLOCK * 3:
             print("[-] Mempool full – try mining first")
@@ -659,18 +816,41 @@ class VexloreChain:
         return True
 
     def mine_pending(self, miner_address: str) -> Optional[Block]:
-        if not self.pending:
-            print("[-] No pending transactions to mine")
-            return None
-        txs_to_include = self.pending[:MAX_TX_PER_BLOCK]
-        remaining = self.pending[MAX_TX_PER_BLOCK:]
-        reward = Transaction(tx_id=str(uuid.uuid4()), sender="VEXLORE_NETWORK", recipient=miner_address,
-                             amount=10.0, timestamp=time.time(), public_key="", signature="", memo="Block reward")
-        txs = txs_to_include + [reward]
+        if not isinstance(miner_address, str) or not miner_address:
+            raise ValueError("miner address must be a non-empty string")
+        known_ids = {
+            item.tx_id
+            for block in self.chain
+            for item in block.transactions
+            if isinstance(item.tx_id, str)
+        }
+        balances = self.balances.copy()
+        included: List[Transaction] = []
+        remaining: List[Transaction] = []
+        for tx in self.pending:
+            next_balances = self._apply_user_transaction(tx, balances, known_ids)
+            if next_balances is None:
+                continue
+            if len(included) >= MAX_TX_PER_BLOCK:
+                remaining.append(tx)
+                continue
+            included.append(tx)
+            balances = next_balances
+            known_ids.add(tx.tx_id)
+
+        reward = Transaction(
+            tx_id=str(uuid.uuid4()), sender="VEXLORE_NETWORK", recipient=miner_address,
+            amount=BLOCK_REWARD, timestamp=time.time(), public_key="", signature="",
+            memo="Block reward",
+        )
+        txs = included + [reward]
         self.current_difficulty = self._adjust_difficulty()
-        block = Block(index=len(self.chain), timestamp=time.time(), transactions=txs,
-                      previous_hash=self.last_block.hash, difficulty=self.current_difficulty, miner=miner_address)
-        print(f"[*] Mining block #{block.index} (difficulty {block.difficulty}, {len(txs)-1} txs) ...")
+        block = Block(
+            index=len(self.chain), timestamp=time.time(), transactions=txs,
+            previous_hash=self.last_block.hash, difficulty=self.current_difficulty,
+            miner=miner_address,
+        )
+        print(f"[*] Mining block #{block.index} (difficulty {block.difficulty}, {len(included)} txs) ...")
         start = time.time()
         block.mine()
         print(f"[+] Block mined in {time.time()-start:.2f}s  hash={block.hash}")
@@ -688,24 +868,44 @@ class VexloreChain:
 
     def is_valid(self, chain: Optional[List[Block]] = None) -> bool:
         blocks = chain if chain is not None else self.chain
-        if not blocks or blocks[0].index != 0 or blocks[0].previous_hash != "0" * 64:
+        if not blocks:
             return False
+        genesis = blocks[0]
+        if (
+            not isinstance(genesis, Block)
+            or not isinstance(genesis.index, int)
+            or isinstance(genesis.index, bool)
+            or genesis.index != 0
+            or genesis.previous_hash != "0" * 64
+            or genesis.difficulty != INITIAL_DIFFICULTY
+            or not self._finite_number(genesis.timestamp)
+            or not isinstance(genesis.transactions, list)
+            or not isinstance(genesis.hash, str)
+            or genesis.to_dict() != canonical_genesis_block().to_dict()
+        ):
+            return False
+        balances: Dict[str, float] = {}
+        known_ids = {
+            tx.tx_id
+            for tx in genesis.transactions
+            if isinstance(tx, Transaction) and isinstance(tx.tx_id, str)
+        }
         for i in range(1, len(blocks)):
-            current, previous = blocks[i], blocks[i-1]
-            if current.index != previous.index + 1 or current.previous_hash != previous.hash:
+            current, previous = blocks[i], blocks[i - 1]
+            if (
+                not isinstance(current, Block)
+                or not isinstance(current.index, int)
+                or isinstance(current.index, bool)
+                or current.index != previous.index + 1
+                or current.previous_hash != previous.hash
+            ):
                 return False
-            if not current.hash.startswith("0" * current.difficulty) or current.hash != current.compute_hash():
+            updated = self._replay_block(current, blocks[:i], balances, known_ids)
+            if updated is None:
                 return False
-            for tx in current.transactions:
-                if tx.sender != "VEXLORE_NETWORK" and not tx.verify():
-                    return False
+            balances = updated
+            known_ids.update(tx.tx_id for tx in current.transactions)
         return True
-
-    def faucet(self, address: str, amount: float = 100.0) -> None:
-        tx = Transaction(tx_id=str(uuid.uuid4()), sender="VEXLORE_NETWORK", recipient=address,
-                         amount=amount, timestamp=time.time(), public_key="", signature="", memo="Faucet drop")
-        self.pending.append(tx)
-        print(f"[+] Faucet: {amount} VEX queued for {address}  (mempool: {len(self.pending)})")
 
     def replace_chain(self, new_blocks: List[Block]) -> bool:
         if len(new_blocks) <= len(self.chain) or not self.is_valid(new_blocks):
@@ -713,29 +913,44 @@ class VexloreChain:
                 print("[-] Received chain failed validation – ignored")
             return False
         print(f"[+] Adopting longer chain ({len(self.chain)} → {len(new_blocks)} blocks)")
+        balances: Dict[str, float] = {}
+        known_ids = {
+            tx.tx_id
+            for tx in new_blocks[0].transactions
+            if isinstance(tx, Transaction) and isinstance(tx.tx_id, str)
+        }
+        for block in new_blocks[1:]:
+            updated = self._replay_block(block, new_blocks[:block.index], balances, known_ids)
+            if updated is None:
+                return False
+            balances = updated
+            known_ids.update(tx.tx_id for tx in block.transactions)
         self.chain = new_blocks
-        self.balances = {}
-        for block in self.chain:
-            for tx in block.transactions:
-                if tx.sender != "VEXLORE_NETWORK":
-                    self.balances[tx.sender] = self.balances.get(tx.sender, 0.0) - tx.amount
-                self.balances[tx.recipient] = self.balances.get(tx.recipient, 0.0) + tx.amount
+        self.balances = balances
         self.pending = []
         self.current_difficulty = self.chain[-1].difficulty
         self._save()
         return True
 
     def add_block_from_peer(self, block: Block) -> bool:
-        if (block.index != len(self.chain) or block.previous_hash != self.last_block.hash or
-            block.hash != block.compute_hash() or not block.hash.startswith("0" * block.difficulty)):
+        if (
+            not isinstance(block, Block)
+            or not isinstance(block.index, int)
+            or isinstance(block.index, bool)
+            or block.index != len(self.chain)
+            or block.previous_hash != self.last_block.hash
+        ):
             return False
-        for tx in block.transactions:
-            if tx.sender != "VEXLORE_NETWORK" and not tx.verify():
-                return False
-        for tx in block.transactions:
-            if tx.sender != "VEXLORE_NETWORK":
-                self.balances[tx.sender] = self.balances.get(tx.sender, 0.0) - tx.amount
-            self.balances[tx.recipient] = self.balances.get(tx.recipient, 0.0) + tx.amount
+        known_ids = {
+            tx.tx_id
+            for previous_block in self.chain
+            for tx in previous_block.transactions
+            if isinstance(tx.tx_id, str)
+        }
+        balances = self._replay_block(block, self.chain, self.balances, known_ids)
+        if balances is None:
+            return False
+        self.balances = balances
         confirmed_ids = {t.tx_id for t in block.transactions}
         self.pending = [t for t in self.pending if t.tx_id not in confirmed_ids]
         self.chain.append(block)
@@ -763,30 +978,86 @@ class PeerManager:
     def _load(self) -> None:
         if PEERS_FILE.exists():
             try:
-                self.peers = set(json.loads(PEERS_FILE.read_text()).get("peers", []))
+                candidates = json.loads(PEERS_FILE.read_text()).get("peers", [])
+                if not isinstance(candidates, list):
+                    raise ValueError("peer list must be a list")
+                self.peers = {
+                    normalized
+                    for peer in candidates
+                    if isinstance(peer, str)
+                    for normalized in [self._normalize_url(peer)]
+                    if normalized and normalized != self.self_url
+                }
             except Exception:
                 self.peers = set()
 
     def _save(self) -> None:
         PEERS_FILE.write_text(json.dumps({"peers": sorted(self.peers), "updated": time.time()}, indent=2))
 
+    @staticmethod
+    def _normalize_url(url: str) -> Optional[str]:
+        if not isinstance(url, str) or not url or len(url) > 2048 or any(c.isspace() for c in url):
+            return None
+        candidate = url if "://" in url else f"http://{url}"
+        try:
+            parsed = urlsplit(candidate)
+            if (
+                parsed.scheme.lower() not in ("http", "https")
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in ("", "/")
+                or parsed.query
+                or parsed.fragment
+            ):
+                return None
+            hostname = parsed.hostname.rstrip(".")
+            port = parsed.port
+            if port is None:
+                port = 443 if parsed.scheme.lower() == "https" else 80
+            if port < 1:
+                return None
+            try:
+                address = ipaddress.ip_address(hostname)
+            except ValueError:
+                return None
+            if not address.is_global:
+                return None
+            authority_host = f"[{hostname.lower()}]" if ":" in hostname else hostname.lower()
+            default_port = 443 if parsed.scheme.lower() == "https" else 80
+            authority = authority_host if port == default_port else f"{authority_host}:{port}"
+            return urlunsplit((parsed.scheme.lower(), authority, "", "", ""))
+        except (OSError, ValueError):
+            return None
+
+    def request(self, method: str, peer: str, endpoint: str, **kwargs: Any):
+        normalized = self._normalize_url(peer)
+        if normalized is None:
+            raise ValueError("peer URL must use a globally routable IP address")
+        return requests.request(
+            method,
+            f"{normalized}{endpoint}",
+            allow_redirects=False,
+            **kwargs,
+        )
+
     def add(self, url: str) -> bool:
-        url = url.rstrip("/")
-        if not url.startswith("http"):
-            url = "http://" + url
-        if url == self.self_url or url in self.peers:
+        normalized = self._normalize_url(url)
+        if normalized is None:
             return False
-        self.peers.add(url)
+        if normalized == self.self_url or normalized in self.peers:
+            return False
+        self.peers.add(normalized)
         self._save()
-        print(f"[+] Peer added: {url}")
+        print(f"[+] Peer added: {normalized}")
         return True
 
     def remove(self, url: str) -> bool:
-        url = url.rstrip("/")
-        if url in self.peers:
-            self.peers.discard(url)
+        normalized = self._normalize_url(url)
+        if normalized in self.peers:
+            self.peers.discard(normalized)
             self._save()
-            print(f"[+] Peer removed: {url}")
+            print(f"[+] Peer removed: {normalized}")
             return True
         return False
 
@@ -797,7 +1068,7 @@ class PeerManager:
         payload = block.to_dict()
         for peer in list(self.peers):
             try:
-                r = requests.post(f"{peer}/block", json=payload, timeout=5)
+                r = self.request("post", peer, "/block", json=payload, timeout=5)
                 print(f"    → block sent to {peer}" if r.status_code == 200 else f"    → {peer} rejected block ({r.status_code})")
             except Exception as e:
                 print(f"    → {peer} unreachable ({e.__class__.__name__})")
@@ -806,13 +1077,13 @@ class PeerManager:
         payload = tx.to_dict()
         for peer in list(self.peers):
             try:
-                requests.post(f"{peer}/transaction", json=payload, timeout=5)
+                self.request("post", peer, "/transaction", json=payload, timeout=5)
             except Exception:
                 pass
 
     def fetch_chain(self, peer: str) -> Optional[List[Block]]:
         try:
-            r = requests.get(f"{peer}/chain", timeout=8)
+            r = self.request("get", peer, "/chain", timeout=8)
             if r.status_code != 200:
                 return None
             return [Block.from_dict(b) for b in r.json().get("chain", [])]
@@ -821,7 +1092,7 @@ class PeerManager:
 
     def fetch_peers(self, peer: str) -> List[str]:
         try:
-            r = requests.get(f"{peer}/peers", timeout=5)
+            r = self.request("get", peer, "/peers", timeout=5)
             if r.status_code == 200:
                 return r.json().get("peers", [])
         except Exception:
@@ -902,22 +1173,27 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
             ok = self.chain.add_transaction(tx)
             self._json_response(200 if ok else 409, {"status": "ok" if ok else "rejected"})
         elif path == "/peers":
-            url = (data or {}).get("url", "")
+            if not isinstance(data, dict):
+                self._json_response(400, {"error": "JSON object required"})
+                return
+            url = data.get("url", "")
             if url:
-                self.peers.add(url)
-                self._json_response(200, {"status": "added", "peers": self.peers.list()})
+                if self.peers.add(url):
+                    self._json_response(200, {"status": "added", "peers": self.peers.list()})
+                else:
+                    self._json_response(400, {"error": "peer URL is invalid, unsafe, or already known"})
             else:
                 self._json_response(400, {"error": "url required"})
         else:
             self._json_response(404, {"error": "not found"})
 
 class NodeServer:
-    def __init__(self, chain: VexloreChain, port: int = DEFAULT_PORT, host: str = "0.0.0.0"):
+    def __init__(self, chain: VexloreChain, port: int = DEFAULT_PORT, host: str = "127.0.0.1"):
         self.chain = chain
         self.port = port
         self.host = host
-        local_ip = self._guess_local_ip()
-        self.self_url = f"http://{local_ip}:{port}"
+        advertised_host = self._guess_local_ip() if host in ("0.0.0.0", "::") else host
+        self.self_url = f"http://{advertised_host}:{port}"
         self.peers = PeerManager(self.self_url)
         self._server: Optional[HTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -964,22 +1240,22 @@ class NodeServer:
             remote = self.peers.fetch_chain(peer)
             if remote and len(remote) > best_len and self.chain.is_valid(remote):
                 best_chain, best_len = remote, len(remote)
-            for p in self.peers.fetch_peers(peer):
-                self.peers.add(p)
             try:
-                requests.post(f"{peer}/peers", json={"url": self.self_url}, timeout=4)
+                self.peers.request("post", peer, "/peers", json={"url": self.self_url}, timeout=4)
             except Exception:
                 pass
         if best_chain:
             self.chain.replace_chain(best_chain)
 
-    def add_peer(self, url: str) -> None:
-        if self.peers.add(url):
-            try:
-                requests.post(f"{url.rstrip('/')}/peers", json={"url": self.self_url}, timeout=5)
-            except Exception as e:
-                print(f"    (handshake failed: {e})")
-            self.sync_with_peers()
+    def add_peer(self, url: str) -> bool:
+        if not self.peers.add(url):
+            return False
+        try:
+            self.peers.request("post", url, "/peers", json={"url": self.self_url}, timeout=5)
+        except Exception as e:
+            print(f"    (handshake failed: {e})")
+        self.sync_with_peers()
+        return True
 
 def print_banner():
     print(r"""
@@ -1011,7 +1287,8 @@ def main():
         print("[*] No unlocked wallet yet. Use option 1 to create one.")
     node: Optional[NodeServer] = None
     try:
-        node = NodeServer(chain, port=DEFAULT_PORT)
+        host = input("Node bind address [127.0.0.1]: ").strip() or "127.0.0.1"
+        node = NodeServer(chain, port=DEFAULT_PORT, host=host)
         node.start()
     except OSError as e:
         print(f"[!] Could not bind port {DEFAULT_PORT}: {e}")
@@ -1023,7 +1300,7 @@ def main():
         print(f"""
 Commands:
   1) New / Restore wallet     2) Unlock wallet
-  3) Show balance (fast)      4) Faucet (get coins)
+  3) Show balance (fast)      4) Mine 10 VEX reward
   5) Send transaction         6) Mine block
   7) Show chain               8) Validate chain
   9) List my addresses        10) New address
@@ -1072,9 +1349,10 @@ Current: {len(chain.chain)} blocks | difficulty {chain.current_difficulty} | mem
             if not wallet or not wallet._unlocked:
                 print("[-] Unlock a wallet first")
                 continue
-            amount = float(input("Amount [100]: ") or 100)
-            chain.faucet(wallet.address, amount)
-            print("Mine a block (option 6) to receive the coins.")
+            block = chain.mine_pending(wallet.address)
+            print(f"Fixed block reward credited: {chain.get_balance(wallet.address):.2f} VEX")
+            if node and block:
+                node.peers.broadcast_block(block)
         elif choice == "5":
             if not wallet or not wallet._unlocked:
                 print("[-] Unlock a wallet first")
@@ -1165,9 +1443,10 @@ Current: {len(chain.chain)} blocks | difficulty {chain.current_difficulty} | mem
             if not node:
                 print("[-] Node not running – start it first (option 19)")
                 continue
-            url = input("Peer URL (e.g. http://192.168.1.10:5000): ").strip()
+            url = input("Peer URL (HTTP(S) with a public IP address): ").strip()
             if url:
-                node.add_peer(url)
+                if not node.add_peer(url):
+                    print("Peer rejected: use an HTTP(S) URL with a globally routable IP address.")
         elif choice == "16":
             if not node:
                 print("[-] Node not running")
@@ -1198,7 +1477,8 @@ Current: {len(chain.chain)} blocks | difficulty {chain.current_difficulty} | mem
                 print("Invalid port")
                 continue
             try:
-                node = NodeServer(chain, port=port)
+                host = input("Bind address [127.0.0.1]: ").strip() or "127.0.0.1"
+                node = NodeServer(chain, port=port, host=host)
                 node.start()
             except OSError as e:
                 print(f"[-] Could not start: {e}")
