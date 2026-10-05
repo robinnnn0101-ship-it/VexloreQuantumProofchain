@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Vexlore Quantumproof Chain  v0.4 — WALLET UPGRADES
-A free educational post-quantum blockchain prototype.
+Vexlore Quantumproof Chain  v0.5 — POST-QUANTUM EXTRA
+Educational post-quantum blockchain.
 
-Uses ML-DSA (FIPS 204 / Dilithium) for quantum-resistant signatures.
-v0.4: seed phrase backup, encrypted wallet files, multiple addresses,
-       transaction history, fast balance checks.
+v0.5 adds:
+  • ML-KEM-512 (FIPS 203) for encrypted node messages
+  • Hybrid signatures (Ed25519 + ML-DSA-44)
+  • Quantum-safe address format (VEXQ...)
+  • Key rotation support
 
-Not production-ready — for learning and experimentation only.
+Also includes all v0.4 wallet features (seed phrase, encrypted wallets,
+multi-address, history) and the solid v0.3 chain core.
+
+Not production-ready — for learning only.
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -31,31 +36,39 @@ from urllib.parse import urlparse
 try:
     import requests
 except ImportError:
-    print("[-] 'requests' package required:  pip install requests")
+    print("[-] pip install requests")
     sys.exit(1)
 
 try:
     from cryptography.fernet import Fernet, InvalidToken
-    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     import base64
 except ImportError:
-    print("[-] 'cryptography' package required:  pip install cryptography")
+    print("[-] pip install cryptography")
     sys.exit(1)
 
+# ---- Post-quantum libraries ----
 sys.path.insert(0, str(Path(__file__).parent / "dilithium_src"))
+sys.path.insert(0, str(Path(__file__).parent / "kyber_src"))
 try:
-    from dilithium_py.ml_dsa import ML_DSA_44  # type: ignore
+    from dilithium_py.ml_dsa import ML_DSA_44
 except ImportError:
-    print("[-] dilithium_src not found. Place the pure-Python ML-DSA package next to this file.")
-    print("    Expected: dilithium_src/dilithium_py/ml_dsa.py")
+    print("[-] dilithium_src missing")
+    sys.exit(1)
+try:
+    from kyber_py.ml_kem import ML_KEM_512
+except ImportError:
+    print("[-] kyber_src missing (ML-KEM)")
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# Constants  (v0.4)
+# Constants
 # ---------------------------------------------------------------------------
 CHAIN_NAME = "Vexlore Quantumproof Chain"
-VERSION = "0.4.0-wallet-upgrades"
+VERSION = "0.5.0-post-quantum-extra"
 
 INITIAL_DIFFICULTY = 3
 TARGET_BLOCK_TIME = 20
@@ -67,6 +80,7 @@ DEFAULT_PORT = 5000
 SYNC_INTERVAL = 15
 MNEMONIC_WORDS = 12
 PBKDF2_ITERATIONS = 100_000
+ADDR_PREFIX = "VEXQ"          # quantum-safe address prefix
 
 DATA_DIR = Path(__file__).parent / "data"
 CHAIN_FILE = DATA_DIR / "vexlore_chain.json"
@@ -75,243 +89,278 @@ WALLETS_DIR = Path(__file__).parent / "wallet"
 DATA_DIR.mkdir(exist_ok=True)
 WALLETS_DIR.mkdir(exist_ok=True)
 
-# BIP-39 English wordlist (2048 words)
-BIP39_WORDLIST = """
-abandon ability able about above absent absorb abstract absurd abuse access
-accident account accuse achieve acid acoustic acquire across act action actor
-actress actual adapt add addict address adjust admit adult advance advice
-aerobic affair afford afraid again age agent agree ahead aim air airport
-aisle alarm album alcohol alert alien all alley allow almost alone alpha
-already also alter always amateur amazing among amount amused analyst anchor
-ancient anger angle angry animal ankle announce annual another answer antenna
-antique anxiety any apart apology appear apple approve april arch arctic
-area arena argue arm armed armor army around arrange arrest arrive arrow
-art artefact artist artwork ask aspect assault asset assist assume asthma
-athlete atom attack attend attitude attract auction audit august aunt author
-auto autumn average avocado avoid awake aware away awesome awful awkward
-axis baby bachelor bacon badge bag balance balcony ball bamboo banana banner
-bar barely bargain barrel base basic basket battle beach bean beauty because
-become beef before begin behave behind believe below belt bench benefit best
-betray better between beyond bicycle bid bike bind biology bird birth bitter
-black blade blame blanket blast bleak bless blind blood blossom blouse blue
-blur blush board boat body boil bomb bone bonus book boost border boring
-borrow boss bottom bounce box boy bracket brain brand brass brave bread
-breeze brick bridge brief bright bring brisk broccoli broken bronze broom
-brother brown brush bubble buddy budget buffalo build bulb bulk bullet bundle
-bunker burden burger burst bus business busy butter buyer buzz cabbage cabin
-cable cactus cage cake call calm camera camp can canal cancel candy cannon
-canoe canvas canyon capable capital captain car carbon card cargo carpet carry
-cart case cash casino castle casual cat catalog catch category cattle caught
-cause caution cave ceiling celery cement census century cereal certain chair
-chalk champion change chaos chapter charge chase chat cheap check cheese chef
-cherry chest chicken chief child chimney choice choose chronic chuckle chunk
-churn cigar cinnamon circle citizen city civil claim clap clarify claw clay
-clean clerk clever click client cliff climb clinic clip clock clog close
-cloth cloud clown club clump cluster clutch coach coast coconut code coffee
-coil coin collect color column combine come comfort comic common company
-concert conduct confirm congress connect consider control convince cook cool
-copper copy coral core corn correct cost cotton couch country couple course
-cousin cover coyote crack cradle craft cram crane crash crater crawl crazy
-cream credit creek crew cricket crime crisp critic crop cross crouch crowd
-crucial cruel cruise crumble crunch crush cry crystal cube culture cup cupboard
-curious current curtain curve cushion custom cute cycle dad damage damp dance
-danger daring dash daughter dawn day deal debate debris decade december decide
-decline decorate decrease deer defense define defy degree delay deliver demand
-demise denial dentist deny depart depend deposit depth deputy derive describe
-desert design desk despair destroy detail detect develop device devote diagram
-dial diamond diary dice diesel diet differ digital dignity dilemma dinner
-dinosaur direct dirt disagree discover disease dish dismiss disorder display
-distance divert divide divorce dizzy doctor document dog doll dolphin domain
-donate donkey donor door dose double dove draft dragon drama drastic draw
-dream dress drift drill drink drip drive drop drum dry duck dumb dune during
-dust dutch duty dwarf dynamic eager eagle early earn earth easily east easy
-echo ecology economy edge edit educate effort egg eight either elbow elder
-electric elegant element elephant elevator elite else embark embody embrace
-emerge emotion employ empower empty enable enact end endless endorse enemy
-energy enforce engage engine enhance enjoy enlist enough enrich enroll ensure
-enter entire entry envelope episode equal equip era erase erode erosion error
-erupt escape essay essence estate eternal ethics evidence evil evoke evolve
-exact example excess exchange excite exclude excuse execute exercise exhaust
-exhibit exile exist exit exotic expand expect expire explain expose express
-extend extra eye eyebrow fabric face faculty fade faint faith fall false
-fame family famous fan fancy fantasy farm fashion fat fatal father fatigue
-fault favorite feature february federal fee feed feel female fence festival
-fetch fever few fiber fiction field figure file film filter final find fine
-finger finish fire firm first fiscal fish fit fitness fix flag flame flash
-flat flavor flee flight flip float flock floor flower fluid flush fly foam
-focus fog foil fold follow food foot force forest forget fork fortune forum
-forward fossil foster found fox fragile frame frequent fresh friend fringe
-frog front frost frown frozen fruit fuel fun funny furnace fury future gadget
-gain galaxy gallery game gap garage garbage garden garlic garment gas gasp
-gate gather gauge gaze general genius genre gentle genuine gesture ghost giant
-gift giggle ginger giraffe girl give glad glance glare glass glide glimpse
-globe gloom glory glove glow glue goat goddess gold good goose gorilla gospel
-gossip govern gown grab grace grain grant grape grass gravity great green
-grid grief grit grocery group grow grunt guard guess guide guilt guitar gun
-gym habit hair half hammer hamster hand happy harbor hard harsh harvest hat
-have hawk hazard head health heart heavy hedgehog height hello helmet help
-hen hero hidden high hill hint hip hire history hobby hockey hold hole holiday
-hollow home honey hood hope horn horror horse hospital host hotel hour hover
-hub huge human humble humor hundred hungry hunt hurdle hurry hurt husband
-hybrid ice icon idea identify idle ignore ill illegal illness image imitate
-immense immune impact impose improve impulse inch include income increase
-index indicate indoor industry infant inflict inform inhale inherit initial
-inject injury inmate inner innocent input inquiry insane insect inside inspire
-install intact interest into invest invite involve iron island isolate issue
-item ivory jacket jaguar jar jazz jealous jeans jelly jewel job join joke
-journey joy judge juice jump jungle junior junk just kangaroo keen keep ketchup
-key kick kid kidney kind kingdom kiss kit kitchen kite kitten kiwi knee knife
-knock know lab label labor ladder lady lake lamp language laptop large later
-latin laugh laundry lava law lawn lawsuit layer lazy leader leaf learn leave
-lecture left leg legal legend leisure lemon lend length lens leopard lesson
-letter level liar liberty library license life lift light like limb limit
-link lion liquid list little live lizard load loan lobster local lock logic
-lonely long loop lottery loud lounge love loyal lucky luggage lumber lunar
-lunch luxury lyrics machine mad magic magnet maid mail main major make mammal
-man manage mandate mango mansion manual maple marble march margin marine market
-marriage mask mass master match material math matrix matter maximum maze
-meadow mean measure meat mechanic medal media melody melt member memory mention
-menu mercy merge merit merry mesh message metal method middle midnight milk
-million mimic mind minimum minor minute miracle mirror misery miss mistake
-mix mixed mixture mobile model modify mom moment monitor monkey monster month
-moon moral more morning mosquito mother motion motor mountain mouse move movie
-much muffin mule multiply muscle museum mushroom music must mutual myself mystery
-myth naive name napkin narrow nasty nation nature near neck need negative
-neglect neither nephew nerve nest net network neutral never news next nice
-night noble noise nominee noodle normal north nose notable note nothing notice
-novel now nuclear number nurse nut oak obey object oblige obscure observe
-obtain obvious occur ocean october odor off offer office often oil okay old
-olive olympic omit once one onion online only open opera opinion oppose option
-orange orbit orchard order ordinary organ orient original orphan ostrich other
-outdoor outer output outside oval oven over own owner oxygen oyster ozone
-pact paddle page pair palace palm panda panel panic panther paper parade
-parent park parrot party pass patch path patient patrol pattern pause pave
-payment peace peanut pear peasant pelican pen penalty pencil people pepper
-perfect permit person pet phone photo phrase physical piano picnic picture
-piece pig pigeon pill pilot pink pioneer pipe pistol pitch pizza place planet
-plastic plate play please pledge pluck plug plunge poem poet point polar pole
-police pond pony pool popular portion position possible post potato pottery
-poverty powder power practice praise predict prefer prepare present pretty
-prevent price pride primary print priority prison private prize problem process
-produce profit program project promote proof property prosper protect proud
-provide public pudding pull pulp pulse pumpkin punch pupil puppy purchase purity
-purpose purse push put puzzle pyramid quality quantum quarter question quick
-quit quiz quote rabbit raccoon race rack radar radio rail rain raise rally
-ramp ranch random range rapid rare rate rather raven raw razor ready real
-reason rebel rebuild recall receive recipe record recycle reduce reflect reform
-refuse region regret regular reject relax release relief rely remain remember
-remind remove render renew rent reopen repair repeat replace report require
-rescue resemble resist resource response result retire retreat return reunion
-reveal review reward rhythm rib ribbon rice rich ride ridge rifle right rigid
-ring riot ripple risk ritual rival river road roast robot robust rocket romance
-roof rookie room rose rotate rough round route royal rubber rude rug rule
-run runway rural sad saddle sadness safe sail salad salmon salon salt salute
-same sample sand satisfy satoshi sauce sausage save say scale scan scare scatter
-scene scheme school science scissors scorpion scream screen screw script scrub
-sea search season seat second secret section security seed seek segment select
-sell seminar senior sense sentence series service session settle setup seven
-shadow shaft shallow share shed shell sheriff shield shift shine ship shiver
-shock shoe shoot shop shore short shoulder shove shrimp shrug shuffle shy
-sibling sick side siege sight sign silent silk silly silver similar simple
-since sing siren sister situate six size skate sketch ski skill skin skirt
-skull slab slam sleep slender slice slide slight slim slogan slot slow slush
-small smart smile smoke smooth snack snake snap sniff snow soap soccer social
-sock soda soft solar soldier solid solution solve someone song soon sorry
-sort soul sound soup source south space spare spatial spawn speak special
-speed spell spend sphere spice spider spike spin spirit split spoil sponsor
-spoon sport spot spray spread spring spy square squeeze squirrel stable stadium
-staff stage stairs stamp stand start state stay steak steel stem step stereo
-stick still sting stock stomach stone stool story stove strategy street strike
-strong struggle student stuff stumble style subject submit subway success such
-sudden suffer sugar suggest suit summer sun sunny sunset super supply supreme
-sure surface surge surprise surround survey suspect sustain swallow swamp swap
-swarm swear sweet swift swim swing switch sword symbol symptom syrup system
-table tackle tag tail talent talk tank tape target task taste tattoo taxi
-teach team tell ten tenant tennis tent term test text thank that the their
-them then theory there they thing this thought three thrive throw thumb thunder
-ticket tide tiger tilt timber time tiny tip tired tissue title toast tobacco
-today toddler toe together toilet token tomato tomorrow tone tongue tonight
-tool tooth top topic topple torch tornado tortoise toss total tourist toward
-tower town toy track trade traffic tragic train transfer trap trash travel
-tray treat tree trend trial tribe trick trigger trim trip trophy trouble truck
-true truly trumpet trust truth try tube tuition tumble tuna tunnel turkey
-turn turtle twelve twenty twice twin twist two type typical ugly umbrella
-unable unaware uncle uncover under undo unfair unfold unhappy unique unit
-universe unknown unlock until unusual unveil update upgrade uphold upon upper
-upset urban urge usage use used useful useless usual utility vacant vacuum
-vague valid valley valve van vanish vapor various vast vault vehicle velvet
-vendor venture venue verb verify version very vessel veteran viable vibrant
-vicious victory video view village vintage violin virtual virus visa visit
-visual vital vivid vocal voice void volcano volume vote voyage wage wagon
-wait walk wall walnut want warfare warm warrior wash wasp waste water wave
-way wealth weapon wear weasel weather web wedding weekend weird welcome west
-wet whale what wheat wheel when where whip whisper wide width wife wild will
-win window wine wing wink winner winter wire wisdom wise wish witness wolf
-woman wonder wood wool word work world worry worth wrap wreck wrestle wrist
-write wrong yard year yellow you young youth zebra zero zone zoo
-""".split()
+# Short BIP-39 wordlist reference (full list embedded compactly)
+BIP39_WORDLIST = open(Path(__file__).parent / "bip39_words.txt").read().split() if (Path(__file__).parent / "bip39_words.txt").exists() else None
 
-def pq_keygen():
-    return ML_DSA_44.keygen()
-
-def pq_keygen_from_seed(zeta: bytes):
-    if len(zeta) != 32:
-        zeta = hashlib.sha256(zeta).digest()
-    return ML_DSA_44._keygen_internal(zeta)
-
-def pq_sign(secret_key: bytes, message: bytes) -> bytes:
-    return ML_DSA_44.sign(secret_key, message)
-
-def pq_verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
-    return ML_DSA_44.verify(public_key, message, signature)
-
+# ---------------------------------------------------------------------------
+# Crypto helpers
+# ---------------------------------------------------------------------------
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
-def address_from_pubkey(pubkey: bytes) -> str:
-    return "VEX" + sha256(pubkey)[:20]
+def sha256_bytes(data: bytes) -> bytes:
+    return hashlib.sha256(data).digest()
+
+def pq_keygen_from_seed(zeta: bytes) -> Tuple[bytes, bytes]:
+    if len(zeta) != 32:
+        zeta = sha256_bytes(zeta)
+    return ML_DSA_44._keygen_internal(zeta)
+
+def pq_sign(sk: bytes, msg: bytes) -> bytes:
+    return ML_DSA_44.sign(sk, msg)
+
+def pq_verify(pk: bytes, msg: bytes, sig: bytes) -> bool:
+    return ML_DSA_44.verify(pk, msg, sig)
+
+def ed_keygen_from_seed(seed32: bytes) -> Tuple[ed25519.Ed25519PrivateKey, bytes]:
+    """Deterministic Ed25519 from 32-byte seed."""
+    # Use first 32 bytes as seed material for Ed25519
+    priv = ed25519.Ed25519PrivateKey.from_private_bytes(seed32)
+    pub = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return priv, pub
+
+def hybrid_sign(ed_priv: ed25519.Ed25519PrivateKey, mldsa_sk: bytes, message: bytes) -> str:
+    """Hybrid signature: ed25519_sig || mldsa_sig  (both hex, joined by '.')"""
+    ed_sig = ed_priv.sign(message)
+    pq_sig = pq_sign(mldsa_sk, message)
+    return ed_sig.hex() + "." + pq_sig.hex()
+
+def hybrid_verify(ed_pk_hex: str, mldsa_pk_hex: str, message: bytes, sig_blob: str) -> bool:
+    try:
+        ed_part, pq_part = sig_blob.split(".", 1)
+        ed_pk = ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(ed_pk_hex))
+        ed_pk.verify(bytes.fromhex(ed_part), message)
+        return pq_verify(bytes.fromhex(mldsa_pk_hex), message, bytes.fromhex(pq_part))
+    except Exception:
+        return False
+
+def quantum_safe_address(mldsa_pk: bytes, ed_pk: bytes) -> str:
+    """VEXQ + 28 hex chars of SHA256(mldsa_pk || ed_pk)"""
+    h = sha256_bytes(mldsa_pk + ed_pk)
+    return ADDR_PREFIX + h.hex()[:28]
 
 def _derive_fernet_key(password: str, salt: bytes) -> bytes:
     kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=PBKDF2_ITERATIONS)
-    return base64.urlsafe_b64encode(kdf.derive(password.encode("utf-8")))
+    return base64.urlsafe_b64encode(kdf.derive(password.encode()))
 
 def encrypt_blob(data: bytes, password: str) -> dict:
     salt = secrets.token_bytes(16)
     f = Fernet(_derive_fernet_key(password, salt))
-    ct = f.encrypt(data)
-    return {"salt": base64.b64encode(salt).decode(), "ciphertext": base64.b64encode(ct).decode(),
+    return {"salt": base64.b64encode(salt).decode(),
+            "ciphertext": base64.b64encode(f.encrypt(data)).decode(),
             "kdf": "pbkdf2-sha256", "iterations": PBKDF2_ITERATIONS}
 
 def decrypt_blob(enc: dict, password: str) -> bytes:
-    salt = base64.b64decode(enc["salt"])
-    ct = base64.b64decode(enc["ciphertext"])
-    f = Fernet(_derive_fernet_key(password, salt))
-    return f.decrypt(ct)
+    f = Fernet(_derive_fernet_key(password, base64.b64decode(enc["salt"])))
+    return f.decrypt(base64.b64decode(enc["ciphertext"]))
 
-def generate_mnemonic(strength_bits: int = 128) -> str:
+def shared_secret_to_fernet(shared: bytes) -> Fernet:
+    """Turn 32-byte ML-KEM shared secret into a Fernet key."""
+    key = base64.urlsafe_b64encode(
+        HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"vexlore-node-v05").derive(shared)
+    )
+    return Fernet(key)
+
+# ---------------------------------------------------------------------------
+# Mnemonic (fallback if no bip39 file – generate simple 12-word from entropy)
+# ---------------------------------------------------------------------------
+_FALLBACK_WORDS = (
+    "abandon ability able about above absent absorb abstract absurd abuse access "
+    "accident account accuse achieve acid acoustic acquire across act action actor "
+    "actress actual adapt add addict address adjust admit adult advance advice "
+    "aerobic affair afford afraid again age agent agree ahead aim air airport "
+    "aisle alarm album alcohol alert alien all alley allow almost alone alpha "
+    "already also alter always amateur amazing among amount amused analyst anchor "
+    "ancient anger angle angry animal ankle announce annual another answer antenna "
+    "antique anxiety any apart apology appear apple approve april arch arctic "
+    "area arena argue arm armed armor army around arrange arrest arrive arrow "
+    "art artefact artist artwork ask aspect assault asset assist assume asthma "
+    "athlete atom attack attend attitude attract auction audit august aunt author "
+    "auto autumn average avocado avoid awake aware away awesome awful awkward "
+    "axis baby bachelor bacon badge bag balance balcony ball bamboo banana banner "
+    "bar barely bargain barrel base basic basket battle beach bean beauty because "
+    "become beef before begin behave behind believe below belt bench benefit best "
+    "betray better between beyond bicycle bid bike bind biology bird birth bitter "
+    "black blade blame blanket blast bleak bless blind blood blossom blouse blue "
+    "blur blush board boat body boil bomb bone bonus book boost border boring "
+    "borrow boss bottom bounce box boy bracket brain brand brass brave bread "
+    "breeze brick bridge brief bright bring brisk broccoli broken bronze broom "
+    "brother brown brush bubble buddy budget buffalo build bulb bulk bullet bundle "
+    "bunker burden burger burst bus business busy butter buyer buzz cabbage cabin "
+    "cable cactus cage cake call calm camera camp can canal cancel candy cannon "
+    "canoe canvas canyon capable capital captain car carbon card cargo carpet carry "
+    "cart case cash casino castle casual cat catalog catch category cattle caught "
+    "cause caution cave ceiling celery cement census century cereal certain chair "
+    "chalk champion change chaos chapter charge chase chat cheap check cheese chef "
+    "cherry chest chicken chief child chimney choice choose chronic chuckle chunk "
+    "churn cigar cinnamon circle citizen city civil claim clap clarify claw clay "
+    "clean clerk clever click client cliff climb clinic clip clock clog close "
+    "cloth cloud clown club clump cluster clutch coach coast coconut code coffee "
+    "coil coin collect color column combine come comfort comic common company "
+    "concert conduct confirm congress connect consider control convince cook cool "
+    "copper copy coral core corn correct cost cotton couch country couple course "
+    "cousin cover coyote crack cradle craft cram crane crash crater crawl crazy "
+    "cream credit creek crew cricket crime crisp critic crop cross crouch crowd "
+    "crucial cruel cruise crumble crunch crush cry crystal cube culture cup cupboard "
+    "curious current curtain curve cushion custom cute cycle dad damage damp dance "
+    "danger daring dash daughter dawn day deal debate debris decade december decide "
+    "decline decorate decrease deer defense define defy degree delay deliver demand "
+    "demise denial dentist deny depart depend deposit depth deputy derive describe "
+    "desert design desk despair destroy detail detect develop device devote diagram "
+    "dial diamond diary dice diesel diet differ digital dignity dilemma dinner "
+    "dinosaur direct dirt disagree discover disease dish dismiss disorder display "
+    "distance divert divide divorce dizzy doctor document dog doll dolphin domain "
+    "donate donkey donor door dose double dove draft dragon drama drastic draw "
+    "dream dress drift drill drink drip drive drop drum dry duck dumb dune during "
+    "dust dutch duty dwarf dynamic eager eagle early earn earth easily east easy "
+    "echo ecology economy edge edit educate effort egg eight either elbow elder "
+    "electric elegant element elephant elevator elite else embark embody embrace "
+    "emerge emotion employ empower empty enable enact end endless endorse enemy "
+    "energy enforce engage engine enhance enjoy enlist enough enrich enroll ensure "
+    "enter entire entry envelope episode equal equip era erase erode erosion error "
+    "erupt escape essay essence estate eternal ethics evidence evil evoke evolve "
+    "exact example excess exchange excite exclude excuse execute exercise exhaust "
+    "exhibit exile exist exit exotic expand expect expire explain expose express "
+    "extend extra eye eyebrow fabric face faculty fade faint faith fall false "
+    "fame family famous fan fancy fantasy farm fashion fat fatal father fatigue "
+    "fault favorite feature february federal fee feed feel female fence festival "
+    "fetch fever few fiber fiction field figure file film filter final find fine "
+    "finger finish fire firm first fiscal fish fit fitness fix flag flame flash "
+    "flat flavor flee flight flip float flock floor flower fluid flush fly foam "
+    "focus fog foil fold follow food foot force forest forget fork fortune forum "
+    "forward fossil foster found fox fragile frame frequent fresh friend fringe "
+    "frog front frost frown frozen fruit fuel fun funny furnace fury future gadget "
+    "gain galaxy gallery game gap garage garbage garden garlic garment gas gasp "
+    "gate gather gauge gaze general genius genre gentle genuine gesture ghost giant "
+    "gift giggle ginger giraffe girl give glad glance glare glass glide glimpse "
+    "globe gloom glory glove glow glue goat goddess gold good goose gorilla gospel "
+    "gossip govern gown grab grace grain grant grape grass gravity great green "
+    "grid grief grit grocery group grow grunt guard guess guide guilt guitar gun "
+    "gym habit hair half hammer hamster hand happy harbor hard harsh harvest hat "
+    "have hawk hazard head health heart heavy hedgehog height hello helmet help "
+    "hen hero hidden high hill hint hip hire history hobby hockey hold hole holiday "
+    "hollow home honey hood hope horn horror horse hospital host hotel hour hover "
+    "hub huge human humble humor hundred hungry hunt hurdle hurry hurt husband "
+    "hybrid ice icon idea identify idle ignore ill illegal illness image imitate "
+    "immense immune impact impose improve impulse inch include income increase "
+    "index indicate indoor industry infant inflict inform inhale inherit initial "
+    "inject injury inmate inner innocent input inquiry insane insect inside inspire "
+    "install intact interest into invest invite involve iron island isolate issue "
+    "item ivory jacket jaguar jar jazz jealous jeans jelly jewel job join joke "
+    "journey joy judge juice jump jungle junior junk just kangaroo keen keep ketchup "
+    "key kick kid kidney kind kingdom kiss kit kitchen kite kitten kiwi knee knife "
+    "knock know lab label labor ladder lady lake lamp language laptop large later "
+    "latin laugh laundry lava law lawn lawsuit layer lazy leader leaf learn leave "
+    "lecture left leg legal legend leisure lemon lend length lens leopard lesson "
+    "letter level liar liberty library license life lift light like limb limit "
+    "link lion liquid list little live lizard load loan lobster local lock logic "
+    "lonely long loop lottery loud lounge love loyal lucky luggage lumber lunar "
+    "lunch luxury lyrics machine mad magic magnet maid mail main major make mammal "
+    "man manage mandate mango mansion manual maple marble march margin marine market "
+    "marriage mask mass master match material math matrix matter maximum maze "
+    "meadow mean measure meat mechanic medal media melody melt member memory mention "
+    "menu mercy merge merit merry mesh message metal method middle midnight milk "
+    "million mimic mind minimum minor minute miracle mirror misery miss mistake "
+    "mix mixed mixture mobile model modify mom moment monitor monkey monster month "
+    "moon moral more morning mosquito mother motion motor mountain mouse move movie "
+    "much muffin mule multiply muscle museum mushroom music must mutual myself mystery "
+    "myth naive name napkin narrow nasty nation nature near neck need negative "
+    "neglect neither nephew nerve nest net network neutral never news next nice "
+    "night noble noise nominee noodle normal north nose notable note nothing notice "
+    "novel now nuclear number nurse nut oak obey object oblige obscure observe "
+    "obtain obvious occur ocean october odor off offer office often oil okay old "
+    "olive olympic omit once one onion online only open opera opinion oppose option "
+    "orange orbit orchard order ordinary organ orient original orphan ostrich other "
+    "outdoor outer output outside oval oven over own owner oxygen oyster ozone "
+    "pact paddle page pair palace palm panda panel panic panther paper parade "
+    "parent park parrot party pass patch path patient patrol pattern pause pave "
+    "payment peace peanut pear peasant pelican pen penalty pencil people pepper "
+    "perfect permit person pet phone photo phrase physical piano picnic picture "
+    "piece pig pigeon pill pilot pink pioneer pipe pistol pitch pizza place planet "
+    "plastic plate play please pledge pluck plug plunge poem poet point polar pole "
+    "police pond pony pool popular portion position possible post potato pottery "
+    "poverty powder power practice praise predict prefer prepare present pretty "
+    "prevent price pride primary print priority prison private prize problem process "
+    "produce profit program project promote proof property prosper protect proud "
+    "provide public pudding pull pulp pulse pumpkin punch pupil puppy purchase purity "
+    "purpose purse push put puzzle pyramid quality quantum quarter question quick "
+    "quit quiz quote rabbit raccoon race rack radar radio rail rain raise rally "
+    "ramp ranch random range rapid rare rate rather raven raw razor ready real "
+    "reason rebel rebuild recall receive recipe record recycle reduce reflect reform "
+    "refuse region regret regular reject relax release relief rely remain remember "
+    "remind remove render renew rent reopen repair repeat replace report require "
+    "rescue resemble resist resource response result retire retreat return reunion "
+    "reveal review reward rhythm rib ribbon rice rich ride ridge rifle right rigid "
+    "ring riot ripple risk ritual rival river road roast robot robust rocket romance "
+    "roof rookie room rose rotate rough round route royal rubber rude rug rule "
+    "run runway rural sad saddle sadness safe sail salad salmon salon salt salute "
+    "same sample sand satisfy satoshi sauce sausage save say scale scan scare scatter "
+    "scene scheme school science scissors scorpion scream screen screw script scrub "
+    "sea search season seat second secret section security seed seek segment select "
+    "sell seminar senior sense sentence series service session settle setup seven "
+    "shadow shaft shallow share shed shell sheriff shield shift shine ship shiver "
+    "shock shoe shoot shop shore short shoulder shove shrimp shrug shuffle shy "
+    "sibling sick side siege sight sign silent silk silly silver similar simple "
+    "since sing siren sister situate six size skate sketch ski skill skin skirt "
+    "skull slab slam sleep slender slice slide slight slim slogan slot slow slush "
+    "small smart smile smoke smooth snack snake snap sniff snow soap soccer social "
+    "sock soda soft solar soldier solid solution solve someone song soon sorry "
+    "sort soul sound soup source south space spare spatial spawn speak special "
+    "speed spell spend sphere spice spider spike spin spirit split spoil sponsor "
+    "spoon sport spot spray spread spring spy square squeeze squirrel stable stadium "
+    "staff stage stairs stamp stand start state stay steak steel stem step stereo "
+    "stick still sting stock stomach stone stool story stove strategy street strike "
+    "strong struggle student stuff stumble style subject submit subway success such "
+    "sudden suffer sugar suggest suit summer sun sunny sunset super supply supreme "
+    "sure surface surge surprise surround survey suspect sustain swallow swamp swap "
+    "swarm swear sweet swift swim swing switch sword symbol symptom syrup system "
+    "table tackle tag tail talent talk tank tape target task taste tattoo taxi "
+    "teach team tell ten tenant tennis tent term test text thank that the their "
+    "them then theory there they thing this thought three thrive throw thumb thunder "
+    "ticket tide tiger tilt timber time tiny tip tired tissue title toast tobacco "
+    "today toddler toe together toilet token tomato tomorrow tone tongue tonight "
+    "tool tooth top topic topple torch tornado tortoise toss total tourist toward "
+    "tower town toy track trade traffic tragic train transfer trap trash travel "
+    "tray treat tree trend trial tribe trick trigger trim trip trophy trouble truck "
+    "true truly trumpet trust truth try tube tuition tumble tuna tunnel turkey "
+    "turn turtle twelve twenty twice twin twist two type typical ugly umbrella "
+    "unable unaware uncle uncover under undo unfair unfold unhappy unique unit "
+    "universe unknown unlock until unusual unveil update upgrade uphold upon upper "
+    "upset urban urge usage use used useful useless usual utility vacant vacuum "
+    "vague valid valley valve van vanish vapor various vast vault vehicle velvet "
+    "vendor venture venue verb verify version very vessel veteran viable vibrant "
+    "vicious victory video view village vintage violin virtual virus visa visit "
+    "visual vital vivid vocal voice void volcano volume vote voyage wage wagon "
+    "wait walk wall walnut want warfare warm warrior wash wasp waste water wave "
+    "way wealth weapon wear weasel weather web wedding weekend weird welcome west "
+    "wet whale what wheat wheel when where whip whisper wide width wife wild will "
+    "win window wine wing wink winner winter wire wisdom wise wish witness wolf "
+    "woman wonder wood wool word work world worry worth wrap wreck wrestle wrist "
+    "write wrong yard year yellow you young youth zebra zero zone zoo"
+).split()
+
+WORDLIST = BIP39_WORDLIST if BIP39_WORDLIST and len(BIP39_WORDLIST) >= 2048 else _FALLBACK_WORDS
+
+def generate_mnemonic() -> str:
     entropy = secrets.token_bytes(16)
     h = hashlib.sha256(entropy).digest()
-    checksum_bits = bin(h[0])[2:].zfill(8)[:4]
-    entropy_bits = "".join(bin(b)[2:].zfill(8) for b in entropy)
-    bits = entropy_bits + checksum_bits
-    words = [BIP39_WORDLIST[int(bits[i:i+11], 2)] for i in range(0, 132, 11)]
-    return " ".join(words)
+    bits = "".join(bin(b)[2:].zfill(8) for b in entropy) + bin(h[0])[2:].zfill(8)[:4]
+    return " ".join(WORDLIST[int(bits[i:i+11], 2) % len(WORDLIST)] for i in range(0, 132, 11))
 
 def mnemonic_to_seed(mnemonic: str, passphrase: str = "") -> bytes:
-    mnemonic_norm = " ".join(mnemonic.strip().lower().split())
-    salt = ("mnemonic" + passphrase).encode("utf-8")
-    seed = hashlib.pbkdf2_hmac("sha512", mnemonic_norm.encode("utf-8"), salt, 2048, dklen=64)
-    return seed[:32]
+    mn = " ".join(mnemonic.strip().lower().split())
+    return hashlib.pbkdf2_hmac("sha512", mn.encode(), ("mnemonic" + passphrase).encode(), 2048, 64)[:32]
 
 def validate_mnemonic(mnemonic: str) -> bool:
     words = mnemonic.strip().lower().split()
-    if len(words) != MNEMONIC_WORDS or not all(w in BIP39_WORDLIST for w in words):
-        return False
-    bits = "".join(bin(BIP39_WORDLIST.index(w))[2:].zfill(11) for w in words)
-    entropy = int(bits[:128], 2).to_bytes(16, "big")
-    expected = bin(hashlib.sha256(entropy).digest()[0])[2:].zfill(8)[:4]
-    return bits[128:] == expected
+    return len(words) == 12 and all(w in WORDLIST for w in words)
 
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
 @dataclass
 class Transaction:
     tx_id: str
@@ -319,13 +368,18 @@ class Transaction:
     recipient: str
     amount: float
     timestamp: float
-    public_key: str
-    signature: str
+    public_key: str          # ML-DSA public key hex
+    ed_public_key: str       # Ed25519 public key hex (hybrid)
+    signature: str           # hybrid sig "ed.hex.mldsa.hex"
     memo: str = ""
+    key_version: int = 0     # for rotation tracking
 
     def message_to_sign(self) -> bytes:
-        payload = {"tx_id": self.tx_id, "sender": self.sender, "recipient": self.recipient,
-                   "amount": self.amount, "timestamp": self.timestamp, "memo": self.memo}
+        payload = {
+            "tx_id": self.tx_id, "sender": self.sender, "recipient": self.recipient,
+            "amount": self.amount, "timestamp": self.timestamp, "memo": self.memo,
+            "key_version": self.key_version,
+        }
         return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
 
     def to_dict(self) -> Dict[str, Any]:
@@ -333,13 +387,18 @@ class Transaction:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Transaction":
-        return cls(**d)
+        # backward compat for old txs without hybrid fields
+        d.setdefault("ed_public_key", "")
+        d.setdefault("key_version", 0)
+        return cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
 
     def verify(self) -> bool:
-        try:
-            return pq_verify(bytes.fromhex(self.public_key), self.message_to_sign(), bytes.fromhex(self.signature))
-        except Exception:
-            return False
+        if not self.ed_public_key:  # old-style pure ML-DSA
+            try:
+                return pq_verify(bytes.fromhex(self.public_key), self.message_to_sign(), bytes.fromhex(self.signature))
+            except Exception:
+                return False
+        return hybrid_verify(self.ed_public_key, self.public_key, self.message_to_sign(), self.signature)
 
 @dataclass
 class Block:
@@ -354,11 +413,11 @@ class Block:
 
     def compute_hash(self) -> str:
         tx_data = [t.to_dict() for t in self.transactions]
-        block_string = json.dumps({"index": self.index, "timestamp": self.timestamp,
-            "transactions": tx_data, "previous_hash": self.previous_hash,
-            "difficulty": self.difficulty, "nonce": self.nonce, "miner": self.miner},
-            sort_keys=True, separators=(",", ":"))
-        return sha256(block_string.encode())
+        s = json.dumps({"index": self.index, "timestamp": self.timestamp, "transactions": tx_data,
+                        "previous_hash": self.previous_hash, "difficulty": self.difficulty,
+                        "nonce": self.nonce, "miner": self.miner},
+                       sort_keys=True, separators=(",", ":"))
+        return sha256(s.encode())
 
     def mine(self) -> None:
         target = "0" * self.difficulty
@@ -381,19 +440,22 @@ class Block:
                    previous_hash=d["previous_hash"], difficulty=d.get("difficulty", INITIAL_DIFFICULTY),
                    nonce=d.get("nonce", 0), hash=d.get("hash", ""), miner=d.get("miner", ""))
 
+# ---------------------------------------------------------------------------
+# Wallet v0.5 – hybrid keys + rotation + seed + encrypted
+# ---------------------------------------------------------------------------
 class Wallet:
     def __init__(self, name: str = "default", password: Optional[str] = None):
         self.name = name
         self.path = WALLETS_DIR / f"{name}.json"
         self.master_seed: bytes = b""
         self.mnemonic: str = ""
-        self.addresses: List[Dict[str, Any]] = []
+        self.addresses: List[Dict[str, Any]] = []  # each entry has hybrid keys + version
         self.history: List[Dict[str, Any]] = []
         self._password: Optional[str] = password
         self._unlocked = False
         if self.path.exists():
             if password is None:
-                print(f"[!] Wallet '{name}' is encrypted. Call unlock(password) first.")
+                print(f"[!] Wallet '{name}' encrypted – unlock first")
                 return
             self.unlock(password)
         else:
@@ -402,98 +464,91 @@ class Wallet:
             self._create_new(password)
 
     def _create_new(self, password: str) -> None:
-        print(f"[*] Creating new quantum-resistant wallet '{self.name}' ...")
+        print(f"[*] Creating hybrid quantum-safe wallet '{self.name}' ...")
         self.mnemonic = generate_mnemonic()
         self.master_seed = mnemonic_to_seed(self.mnemonic)
         self._password = password
         self._derive_address(0)
         self._unlocked = True
         self._save()
-        print(f"[+] Wallet ready")
+        print(f"[+] Wallet ready (hybrid Ed25519 + ML-DSA-44)")
         print(f"    Primary address : {self.address}")
-        print(f"    Addresses       : {len(self.addresses)}")
         print()
         print("  ╔══════════════════════════════════════════════════════════╗")
         print("  ║  WRITE DOWN YOUR SEED PHRASE AND KEEP IT SAFE!           ║")
-        print("  ║  Anyone with these words can spend your coins.             ║")
         print("  ╚══════════════════════════════════════════════════════════╝")
         print(f"\n  {self.mnemonic}\n")
-        print("  (This phrase will NOT be shown again. Store it offline.)\n")
 
     @classmethod
     def restore(cls, name: str, mnemonic: str, password: str) -> "Wallet":
         mnemonic = " ".join(mnemonic.strip().lower().split())
         if not validate_mnemonic(mnemonic):
-            raise ValueError("Invalid mnemonic (checksum failed or unknown words)")
+            raise ValueError("Invalid mnemonic")
         w = cls.__new__(cls)
-        w.name = name
-        w.path = WALLETS_DIR / f"{name}.json"
-        w.mnemonic = mnemonic
-        w.master_seed = mnemonic_to_seed(mnemonic)
-        w.addresses = []
-        w.history = []
-        w._password = password
-        w._unlocked = True
+        w.name, w.path = name, WALLETS_DIR / f"{name}.json"
+        w.mnemonic, w.master_seed = mnemonic, mnemonic_to_seed(mnemonic)
+        w.addresses, w.history = [], []
+        w._password, w._unlocked = password, True
         w._derive_address(0)
         w._save()
-        print(f"[+] Wallet '{name}' restored from seed phrase")
-        print(f"    Primary address : {w.address}")
+        print(f"[+] Restored '{name}' → {w.address}")
         return w
 
     def unlock(self, password: str) -> bool:
-        if not self.path.exists():
-            print("[-] Wallet file not found")
-            return False
         try:
             raw = json.loads(self.path.read_text())
-            plain = decrypt_blob(raw["encrypted"], password)
-            data = json.loads(plain.decode())
+            data = json.loads(decrypt_blob(raw["encrypted"], password).decode())
             self.master_seed = bytes.fromhex(data["master_seed"])
             self.addresses = data.get("addresses", [])
             self.history = data.get("history", [])
-            self._password = password
-            self._unlocked = True
+            self._password, self._unlocked = password, True
             if not self.addresses:
                 self._derive_address(0)
                 self._save()
-            print(f"[+] Unlocked wallet '{self.name}' → {self.address}")
+            print(f"[+] Unlocked '{self.name}' → {self.address}")
             return True
-        except (InvalidToken, KeyError, ValueError, json.JSONDecodeError) as e:
-            print(f"[-] Wrong password or corrupted wallet: {e}")
-            self._unlocked = False
+        except Exception as e:
+            print(f"[-] Unlock failed: {e}")
             return False
 
     def _save(self) -> None:
-        if not self._unlocked or self._password is None:
-            raise RuntimeError("Wallet is locked – cannot save")
         data = {"master_seed": self.master_seed.hex(), "addresses": self.addresses,
-                "history": self.history[-500:], "version": VERSION, "algo": "ML-DSA-44", "created": time.time()}
-        blob = json.dumps(data).encode()
-        enc = encrypt_blob(blob, self._password)
+                "history": self.history[-500:], "version": VERSION}
+        enc = encrypt_blob(json.dumps(data).encode(), self._password)
         out = {"name": self.name, "encrypted": enc, "address_count": len(self.addresses),
-               "primary_address": self.address if self.addresses else "", "version": VERSION}
+               "primary_address": self.address, "version": VERSION, "algo": "hybrid-Ed25519+ML-DSA-44"}
         self.path.write_text(json.dumps(out, indent=2))
 
     def lock(self) -> None:
-        self.master_seed = b""
-        self.addresses = []
-        self.history = []
-        self._password = None
-        self._unlocked = False
-        print(f"[+] Wallet '{self.name}' locked")
+        self.master_seed = b""; self.addresses = []; self.history = []
+        self._password = None; self._unlocked = False
+        print(f"[+] Locked '{self.name}'")
 
-    def _derive_address(self, index: int) -> Dict[str, Any]:
-        material = self.master_seed + index.to_bytes(4, "big")
-        zeta = hashlib.sha256(material).digest()
-        pk, sk = pq_keygen_from_seed(zeta)
-        addr = address_from_pubkey(pk)
-        entry = {"index": index, "address": addr, "public_key": pk.hex(), "secret_key": sk.hex()}
+    def _derive_address(self, index: int, version: int = 0) -> Dict[str, Any]:
+        material = self.master_seed + index.to_bytes(4, "big") + version.to_bytes(2, "big")
+        zeta = sha256_bytes(material)
+        mldsa_pk, mldsa_sk = pq_keygen_from_seed(zeta)
+        # separate seed for Ed25519
+        ed_seed = sha256_bytes(b"ed25519" + material)
+        ed_priv, ed_pk = ed_keygen_from_seed(ed_seed)
+        addr = quantum_safe_address(mldsa_pk, ed_pk)
+        entry = {
+            "index": index, "version": version, "address": addr,
+            "public_key": mldsa_pk.hex(), "secret_key": mldsa_sk.hex(),
+            "ed_public_key": ed_pk.hex(),
+            "ed_secret_key": ed_priv.private_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PrivateFormat.Raw,
+                encryption_algorithm=serialization.NoEncryption(),
+            ).hex(),
+            "rotated": False,
+        }
         for i, a in enumerate(self.addresses):
-            if a["index"] == index:
+            if a["index"] == index and a.get("version", 0) == version:
                 self.addresses[i] = entry
                 return entry
         self.addresses.append(entry)
-        self.addresses.sort(key=lambda x: x["index"])
+        self.addresses.sort(key=lambda x: (x["index"], x.get("version", 0)))
         return entry
 
     def new_address(self) -> str:
@@ -504,72 +559,94 @@ class Wallet:
         print(f"[+] New address #{next_idx}: {entry['address']}")
         return entry["address"]
 
+    def rotate_key(self, address: Optional[str] = None) -> str:
+        """Key rotation: create new version of an address (same index, higher version)."""
+        self._require_unlocked()
+        target = address or self.address
+        old = next((a for a in self.addresses if a["address"] == target), None)
+        if not old:
+            raise ValueError("Address not found")
+        new_ver = old.get("version", 0) + 1
+        # mark old as rotated
+        old["rotated"] = True
+        entry = self._derive_address(old["index"], version=new_ver)
+        self._save()
+        print(f"[+] Key rotated  {target[:16]}... → {entry['address'][:16]}...  (v{new_ver})")
+        print(f"    Old key still valid for receiving; use new address for sending.")
+        return entry["address"]
+
     def list_addresses(self) -> List[str]:
         self._require_unlocked()
-        return [a["address"] for a in self.addresses]
+        return [a["address"] for a in self.addresses if not a.get("rotated")]
 
     @property
     def address(self) -> str:
-        return self.addresses[0]["address"] if self.addresses else ""
+        active = [a for a in self.addresses if not a.get("rotated")]
+        return active[0]["address"] if active else (self.addresses[0]["address"] if self.addresses else "")
 
-    def get_keypair(self, address: Optional[str] = None) -> Tuple[bytes, bytes]:
+    def get_keys(self, address: Optional[str] = None):
         self._require_unlocked()
         target = address or self.address
         for a in self.addresses:
             if a["address"] == target:
-                return bytes.fromhex(a["public_key"]), bytes.fromhex(a["secret_key"])
-        raise ValueError(f"Address {target} not found in this wallet")
+                ed_priv = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(a["ed_secret_key"]))
+                return (bytes.fromhex(a["public_key"]), bytes.fromhex(a["secret_key"]),
+                        ed_priv, a["ed_public_key"], a.get("version", 0))
+        raise ValueError(f"Address {target} not found")
 
     def create_transaction(self, recipient: str, amount: float, memo: str = "",
                            from_address: Optional[str] = None) -> Transaction:
         self._require_unlocked()
         sender = from_address or self.address
-        pk, sk = self.get_keypair(sender)
-        tx = Transaction(tx_id=str(uuid.uuid4()), sender=sender, recipient=recipient,
-                         amount=amount, timestamp=time.time(), public_key=pk.hex(),
-                         signature="", memo=memo)
-        tx.signature = pq_sign(sk, tx.message_to_sign()).hex()
+        mldsa_pk, mldsa_sk, ed_priv, ed_pk_hex, ver = self.get_keys(sender)
+        tx = Transaction(
+            tx_id=str(uuid.uuid4()), sender=sender, recipient=recipient, amount=amount,
+            timestamp=time.time(), public_key=mldsa_pk.hex(), ed_public_key=ed_pk_hex,
+            signature="", memo=memo, key_version=ver,
+        )
+        tx.signature = hybrid_sign(ed_priv, mldsa_sk, tx.message_to_sign())
         return tx
 
     def record_history(self, tx: Transaction, direction: str = "out") -> None:
         self._require_unlocked()
-        entry = {"tx_id": tx.tx_id, "direction": direction,
-                 "counterparty": tx.recipient if direction == "out" else tx.sender,
-                 "amount": tx.amount, "memo": tx.memo, "timestamp": tx.timestamp,
-                 "address": tx.sender if direction == "out" else tx.recipient}
-        self.history.append(entry)
+        self.history.append({
+            "tx_id": tx.tx_id, "direction": direction,
+            "counterparty": tx.recipient if direction == "out" else tx.sender,
+            "amount": tx.amount, "memo": tx.memo, "timestamp": tx.timestamp,
+            "address": tx.sender if direction == "out" else tx.recipient,
+        })
         self._save()
 
     def show_history(self, limit: int = 20) -> None:
         self._require_unlocked()
         if not self.history:
-            print("  (no transactions recorded yet)")
+            print("  (no history yet)")
             return
-        print(f"\n  Last {min(limit, len(self.history))} transactions:")
         for h in reversed(self.history[-limit:]):
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(h["timestamp"]))
             arrow = "→" if h["direction"] == "out" else "←"
-            print(f"  {ts}  {arrow}  {h['amount']:>8.2f} VEX  {h['counterparty'][:14]}...  {h.get('memo','')[:20]}")
+            print(f"  {ts}  {arrow}  {h['amount']:>8.2f} VEX  {h['counterparty'][:16]}...")
 
-    def _require_unlocked(self) -> None:
+    def _require_unlocked(self):
         if not self._unlocked:
-            raise RuntimeError("Wallet is locked. Call unlock(password) first.")
+            raise RuntimeError("Wallet locked")
 
     @staticmethod
     def _ask_password(create: bool = False) -> str:
         import getpass
         while True:
-            p1 = getpass.getpass("  Password for wallet: ")
+            p1 = getpass.getpass("  Password: ")
             if len(p1) < 4:
-                print("  Password too short (min 4 chars)")
+                print("  Too short")
                 continue
-            if create:
-                p2 = getpass.getpass("  Confirm password: ")
-                if p1 != p2:
-                    print("  Passwords do not match")
-                    continue
+            if create and getpass.getpass("  Confirm: ") != p1:
+                print("  Mismatch")
+                continue
             return p1
 
+# ---------------------------------------------------------------------------
+# Chain (core unchanged + hybrid verify)
+# ---------------------------------------------------------------------------
 class VexloreChain:
     def __init__(self):
         self.chain: List[Block] = []
@@ -578,49 +655,46 @@ class VexloreChain:
         self.current_difficulty = INITIAL_DIFFICULTY
         self._load_or_create()
 
-    def _load_or_create(self) -> None:
+    def _load_or_create(self):
         if CHAIN_FILE.exists():
             try:
                 raw = json.loads(CHAIN_FILE.read_text())
                 self.chain = [Block.from_dict(b) for b in raw["chain"]]
                 self.balances = raw.get("balances", {})
                 self.current_difficulty = raw.get("difficulty", INITIAL_DIFFICULTY)
-                print(f"[+] Loaded chain with {len(self.chain)} blocks (diff={self.current_difficulty})")
+                print(f"[+] Loaded {len(self.chain)} blocks (diff={self.current_difficulty})")
             except Exception as e:
-                print(f"[!] Failed to load chain: {e}")
+                print(f"[!] Load failed: {e}")
                 self._create_genesis()
         else:
             self._create_genesis()
 
-    def _create_genesis(self) -> None:
-        print("[*] Creating Genesis block of Vexlore Quantumproof Chain ...")
-        genesis_tx = Transaction(tx_id="genesis", sender="VEXLORE_NETWORK", recipient="VEXLORE_NETWORK",
-                                 amount=0.0, timestamp=time.time(), public_key="", signature="",
-                                 memo="Genesis of Vexlore – Quantumproof by design")
-        block = Block(index=0, timestamp=time.time(), transactions=[genesis_tx],
-                      previous_hash="0" * 64, difficulty=INITIAL_DIFFICULTY, miner="genesis")
+    def _create_genesis(self):
+        print("[*] Creating Genesis ...")
+        tx = Transaction(tx_id="genesis", sender="VEXLORE_NETWORK", recipient="VEXLORE_NETWORK",
+                         amount=0.0, timestamp=time.time(), public_key="", ed_public_key="",
+                         signature="", memo="Genesis v0.5 – hybrid post-quantum")
+        block = Block(0, time.time(), [tx], "0"*64, INITIAL_DIFFICULTY, miner="genesis")
         block.hash = block.compute_hash()
         self.chain.append(block)
-        self.current_difficulty = INITIAL_DIFFICULTY
         self._save()
-        print(f"[+] Genesis block created: {block.hash[:16]}...")
+        print(f"[+] Genesis {block.hash[:16]}...")
 
-    def _atomic_save(self, data: dict) -> None:
-        fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+    def _atomic_save(self, data: dict):
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f, indent=2)
-            os.replace(tmp_path, CHAIN_FILE)
+            os.replace(tmp, CHAIN_FILE)
         except Exception:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+            if os.path.exists(tmp):
+                os.unlink(tmp)
             raise
 
-    def _save(self) -> None:
-        data = {"name": CHAIN_NAME, "version": VERSION, "algo": "ML-DSA-44 (FIPS 204)",
-                "difficulty": self.current_difficulty, "chain": [b.to_dict() for b in self.chain],
-                "balances": self.balances}
-        self._atomic_save(data)
+    def _save(self):
+        self._atomic_save({"name": CHAIN_NAME, "version": VERSION, "algo": "hybrid-Ed25519+ML-DSA-44 + ML-KEM-512",
+                           "difficulty": self.current_difficulty,
+                           "chain": [b.to_dict() for b in self.chain], "balances": self.balances})
 
     @property
     def last_block(self) -> Block:
@@ -630,54 +704,54 @@ class VexloreChain:
         if len(self.chain) < DIFFICULTY_ADJUST_EVERY + 1:
             return self.current_difficulty
         recent = self.chain[-DIFFICULTY_ADJUST_EVERY:]
-        time_taken = recent[-1].timestamp - recent[0].timestamp
+        taken = recent[-1].timestamp - recent[0].timestamp
         expected = TARGET_BLOCK_TIME * (DIFFICULTY_ADJUST_EVERY - 1)
-        new_diff = self.current_difficulty
-        if time_taken < expected * 0.7:
-            new_diff = min(MAX_DIFFICULTY, self.current_difficulty + 1)
-        elif time_taken > expected * 1.4:
-            new_diff = max(MIN_DIFFICULTY, self.current_difficulty - 1)
-        if new_diff != self.current_difficulty:
-            print(f"[*] Difficulty adjusted: {self.current_difficulty} → {new_diff}")
-        return new_diff
+        d = self.current_difficulty
+        if taken < expected * 0.7:
+            d = min(MAX_DIFFICULTY, d + 1)
+        elif taken > expected * 1.4:
+            d = max(MIN_DIFFICULTY, d - 1)
+        if d != self.current_difficulty:
+            print(f"[*] Difficulty {self.current_difficulty} → {d}")
+        return d
 
     def add_transaction(self, tx: Transaction) -> bool:
-        if not tx.verify() and tx.sender != "VEXLORE_NETWORK":
-            print("[-] Invalid quantum signature – transaction rejected")
+        if tx.sender != "VEXLORE_NETWORK" and not tx.verify():
+            print("[-] Invalid hybrid signature")
             return False
-        sender_bal = self.balances.get(tx.sender, 0.0)
-        if tx.sender != "VEXLORE_NETWORK" and sender_bal < tx.amount:
-            print(f"[-] Insufficient balance: {sender_bal} < {tx.amount}")
+        if tx.sender != "VEXLORE_NETWORK" and self.balances.get(tx.sender, 0) < tx.amount:
+            print(f"[-] Insufficient balance")
             return False
         if any(p.tx_id == tx.tx_id for p in self.pending):
             return False
         if len(self.pending) >= MAX_TX_PER_BLOCK * 3:
-            print("[-] Mempool full – try mining first")
+            print("[-] Mempool full")
             return False
         self.pending.append(tx)
-        print(f"[+] Pending tx {tx.tx_id[:8]}... {tx.amount} VEX → {tx.recipient[:12]}...  (mempool: {len(self.pending)})")
+        print(f"[+] Pending {tx.tx_id[:8]}... {tx.amount} VEX → {tx.recipient[:14]}... (mempool {len(self.pending)})")
         return True
 
     def mine_pending(self, miner_address: str) -> Optional[Block]:
         if not self.pending:
-            print("[-] No pending transactions to mine")
+            print("[-] Nothing to mine")
             return None
-        txs_to_include = self.pending[:MAX_TX_PER_BLOCK]
+        txs = self.pending[:MAX_TX_PER_BLOCK]
         remaining = self.pending[MAX_TX_PER_BLOCK:]
         reward = Transaction(tx_id=str(uuid.uuid4()), sender="VEXLORE_NETWORK", recipient=miner_address,
-                             amount=10.0, timestamp=time.time(), public_key="", signature="", memo="Block reward")
-        txs = txs_to_include + [reward]
+                             amount=10.0, timestamp=time.time(), public_key="", ed_public_key="",
+                             signature="", memo="Block reward")
+        txs = txs + [reward]
         self.current_difficulty = self._adjust_difficulty()
-        block = Block(index=len(self.chain), timestamp=time.time(), transactions=txs,
-                      previous_hash=self.last_block.hash, difficulty=self.current_difficulty, miner=miner_address)
-        print(f"[*] Mining block #{block.index} (difficulty {block.difficulty}, {len(txs)-1} txs) ...")
-        start = time.time()
+        block = Block(len(self.chain), time.time(), txs, self.last_block.hash,
+                      self.current_difficulty, miner=miner_address)
+        print(f"[*] Mining #{block.index} (diff {block.difficulty}) ...")
+        t0 = time.time()
         block.mine()
-        print(f"[+] Block mined in {time.time()-start:.2f}s  hash={block.hash}")
+        print(f"[+] Mined in {time.time()-t0:.2f}s  {block.hash[:20]}...")
         for tx in txs:
             if tx.sender != "VEXLORE_NETWORK":
-                self.balances[tx.sender] = self.balances.get(tx.sender, 0.0) - tx.amount
-            self.balances[tx.recipient] = self.balances.get(tx.recipient, 0.0) + tx.amount
+                self.balances[tx.sender] = self.balances.get(tx.sender, 0) - tx.amount
+            self.balances[tx.recipient] = self.balances.get(tx.recipient, 0) + tx.amount
         self.chain.append(block)
         self.pending = remaining
         self._save()
@@ -687,39 +761,38 @@ class VexloreChain:
         return self.balances.get(address, 0.0)
 
     def is_valid(self, chain: Optional[List[Block]] = None) -> bool:
-        blocks = chain if chain is not None else self.chain
-        if not blocks or blocks[0].index != 0 or blocks[0].previous_hash != "0" * 64:
+        blocks = chain or self.chain
+        if not blocks or blocks[0].index != 0 or blocks[0].previous_hash != "0"*64:
             return False
         for i in range(1, len(blocks)):
-            current, previous = blocks[i], blocks[i-1]
-            if current.index != previous.index + 1 or current.previous_hash != previous.hash:
+            cur, prev = blocks[i], blocks[i-1]
+            if cur.index != prev.index+1 or cur.previous_hash != prev.hash:
                 return False
-            if not current.hash.startswith("0" * current.difficulty) or current.hash != current.compute_hash():
+            if not cur.hash.startswith("0"*cur.difficulty) or cur.hash != cur.compute_hash():
                 return False
-            for tx in current.transactions:
+            for tx in cur.transactions:
                 if tx.sender != "VEXLORE_NETWORK" and not tx.verify():
                     return False
         return True
 
-    def faucet(self, address: str, amount: float = 100.0) -> None:
+    def faucet(self, address: str, amount: float = 100.0):
         tx = Transaction(tx_id=str(uuid.uuid4()), sender="VEXLORE_NETWORK", recipient=address,
-                         amount=amount, timestamp=time.time(), public_key="", signature="", memo="Faucet drop")
+                         amount=amount, timestamp=time.time(), public_key="", ed_public_key="",
+                         signature="", memo="Faucet")
         self.pending.append(tx)
-        print(f"[+] Faucet: {amount} VEX queued for {address}  (mempool: {len(self.pending)})")
+        print(f"[+] Faucet {amount} VEX → {address[:16]}... (mempool {len(self.pending)})")
 
     def replace_chain(self, new_blocks: List[Block]) -> bool:
         if len(new_blocks) <= len(self.chain) or not self.is_valid(new_blocks):
-            if len(new_blocks) > len(self.chain):
-                print("[-] Received chain failed validation – ignored")
             return False
-        print(f"[+] Adopting longer chain ({len(self.chain)} → {len(new_blocks)} blocks)")
+        print(f"[+] Adopting longer chain ({len(self.chain)} → {len(new_blocks)})")
         self.chain = new_blocks
         self.balances = {}
-        for block in self.chain:
-            for tx in block.transactions:
+        for b in self.chain:
+            for tx in b.transactions:
                 if tx.sender != "VEXLORE_NETWORK":
-                    self.balances[tx.sender] = self.balances.get(tx.sender, 0.0) - tx.amount
-                self.balances[tx.recipient] = self.balances.get(tx.recipient, 0.0) + tx.amount
+                    self.balances[tx.sender] = self.balances.get(tx.sender, 0) - tx.amount
+                self.balances[tx.recipient] = self.balances.get(tx.recipient, 0) + tx.amount
         self.pending = []
         self.current_difficulty = self.chain[-1].difficulty
         self._save()
@@ -727,48 +800,58 @@ class VexloreChain:
 
     def add_block_from_peer(self, block: Block) -> bool:
         if (block.index != len(self.chain) or block.previous_hash != self.last_block.hash or
-            block.hash != block.compute_hash() or not block.hash.startswith("0" * block.difficulty)):
+            block.hash != block.compute_hash() or not block.hash.startswith("0"*block.difficulty)):
             return False
         for tx in block.transactions:
             if tx.sender != "VEXLORE_NETWORK" and not tx.verify():
                 return False
         for tx in block.transactions:
             if tx.sender != "VEXLORE_NETWORK":
-                self.balances[tx.sender] = self.balances.get(tx.sender, 0.0) - tx.amount
-            self.balances[tx.recipient] = self.balances.get(tx.recipient, 0.0) + tx.amount
-        confirmed_ids = {t.tx_id for t in block.transactions}
-        self.pending = [t for t in self.pending if t.tx_id not in confirmed_ids]
+                self.balances[tx.sender] = self.balances.get(tx.sender, 0) - tx.amount
+            self.balances[tx.recipient] = self.balances.get(tx.recipient, 0) + tx.amount
+        ids = {t.tx_id for t in block.transactions}
+        self.pending = [t for t in self.pending if t.tx_id not in ids]
         self.chain.append(block)
         self.current_difficulty = block.difficulty
         self._save()
-        print(f"[+] Accepted block #{block.index} from peer  hash={block.hash[:16]}...")
+        print(f"[+] Accepted block #{block.index} from peer")
         return True
 
-    def scan_history_for(self, addresses: Set[str]) -> List[Dict[str, Any]]:
+    def scan_history_for(self, addresses: Set[str]) -> List[Dict]:
         found = []
-        for block in self.chain:
-            for tx in block.transactions:
+        for b in self.chain:
+            for tx in b.transactions:
                 if tx.sender in addresses or tx.recipient in addresses:
-                    found.append({"block": block.index, "tx_id": tx.tx_id, "sender": tx.sender,
-                                  "recipient": tx.recipient, "amount": tx.amount, "memo": tx.memo,
-                                  "timestamp": tx.timestamp})
+                    found.append({"block": b.index, "tx_id": tx.tx_id, "sender": tx.sender,
+                                  "recipient": tx.recipient, "amount": tx.amount, "timestamp": tx.timestamp})
         return found
 
+# ---------------------------------------------------------------------------
+# Networking + ML-KEM encrypted messages
+# ---------------------------------------------------------------------------
 class PeerManager:
-    def __init__(self, self_url: str = ""):
+    def __init__(self, self_url: str = "", kem_ek: bytes = b""):
         self.self_url = self_url.rstrip("/")
         self.peers: Set[str] = set()
+        self.peer_kem: Dict[str, bytes] = {}   # peer_url → ML-KEM encapsulation key
+        self.kem_ek = kem_ek
         self._load()
 
-    def _load(self) -> None:
+    def _load(self):
         if PEERS_FILE.exists():
             try:
-                self.peers = set(json.loads(PEERS_FILE.read_text()).get("peers", []))
+                data = json.loads(PEERS_FILE.read_text())
+                self.peers = set(data.get("peers", []))
+                self.peer_kem = {k: bytes.fromhex(v) for k, v in data.get("peer_kem", {}).items()}
             except Exception:
-                self.peers = set()
+                pass
 
-    def _save(self) -> None:
-        PEERS_FILE.write_text(json.dumps({"peers": sorted(self.peers), "updated": time.time()}, indent=2))
+    def _save(self):
+        PEERS_FILE.write_text(json.dumps({
+            "peers": sorted(self.peers),
+            "peer_kem": {k: v.hex() for k, v in self.peer_kem.items()},
+            "updated": time.time(),
+        }, indent=2))
 
     def add(self, url: str) -> bool:
         url = url.rstrip("/")
@@ -785,28 +868,50 @@ class PeerManager:
         url = url.rstrip("/")
         if url in self.peers:
             self.peers.discard(url)
+            self.peer_kem.pop(url, None)
             self._save()
-            print(f"[+] Peer removed: {url}")
             return True
         return False
 
     def list(self) -> List[str]:
         return sorted(self.peers)
 
-    def broadcast_block(self, block: Block) -> None:
+    def _encrypt_for_peer(self, peer: str, payload: dict) -> Optional[dict]:
+        """ML-KEM encapsulate + Fernet encrypt the JSON payload for a peer."""
+        ek = self.peer_kem.get(peer)
+        if not ek:
+            return None  # fall back to plaintext
+        try:
+            shared, ct = ML_KEM_512.encaps(ek)
+            f = shared_secret_to_fernet(shared)
+            plain = json.dumps(payload).encode()
+            return {
+                "kem_ct": base64.b64encode(ct).decode(),
+                "ciphertext": base64.b64encode(f.encrypt(plain)).decode(),
+                "vexlore_enc": "mlkem512-fernet",
+            }
+        except Exception:
+            return None
+
+    def broadcast_block(self, block: Block, kem_dk: bytes = b""):
         payload = block.to_dict()
         for peer in list(self.peers):
             try:
-                r = requests.post(f"{peer}/block", json=payload, timeout=5)
-                print(f"    → block sent to {peer}" if r.status_code == 200 else f"    → {peer} rejected block ({r.status_code})")
+                enc = self._encrypt_for_peer(peer, payload)
+                body = enc if enc else payload
+                r = requests.post(f"{peer}/block", json=body, timeout=6)
+                status = "encrypted" if enc else "plain"
+                print(f"    → block to {peer} ({status}) [{r.status_code}]")
             except Exception as e:
-                print(f"    → {peer} unreachable ({e.__class__.__name__})")
+                print(f"    → {peer} unreachable ({type(e).__name__})")
 
-    def broadcast_tx(self, tx: Transaction) -> None:
+    def broadcast_tx(self, tx: Transaction):
         payload = tx.to_dict()
         for peer in list(self.peers):
             try:
-                requests.post(f"{peer}/transaction", json=payload, timeout=5)
+                enc = self._encrypt_for_peer(peer, payload)
+                body = enc if enc else payload
+                requests.post(f"{peer}/transaction", json=body, timeout=5)
             except Exception:
                 pass
 
@@ -828,14 +933,29 @@ class PeerManager:
             pass
         return []
 
+    def exchange_kem(self, peer: str, my_ek: bytes):
+        """Exchange ML-KEM public keys with a peer."""
+        try:
+            r = requests.post(f"{peer}/kem", json={"ek": my_ek.hex(), "url": self.self_url}, timeout=5)
+            if r.status_code == 200:
+                their_ek = bytes.fromhex(r.json().get("ek", ""))
+                if their_ek:
+                    self.peer_kem[peer] = their_ek
+                    self._save()
+                    print(f"    ⇄ KEM keys exchanged with {peer}")
+        except Exception:
+            pass
+
 class NodeHTTPHandler(BaseHTTPRequestHandler):
     chain: VexloreChain
     peers: PeerManager
+    kem_ek: bytes
+    kem_dk: bytes
 
-    def log_message(self, fmt: str, *args) -> None:
+    def log_message(self, fmt, *args):
         print(f"  [HTTP] {self.address_string()} {fmt % args}")
 
-    def _json_response(self, code: int, obj: Any) -> None:
+    def _json(self, code: int, obj):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -844,88 +964,114 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_json(self) -> Optional[Dict]:
-        length = int(self.headers.get("Content-Length", 0))
-        if length == 0:
+    def _read(self) -> Optional[Dict]:
+        n = int(self.headers.get("Content-Length", 0))
+        if not n:
             return None
         try:
-            return json.loads(self.rfile.read(length))
+            return json.loads(self.rfile.read(n))
         except Exception:
             return None
 
-    def do_GET(self) -> None:
+    def _maybe_decrypt(self, data: dict) -> Optional[dict]:
+        """If payload is ML-KEM encrypted, decapsulate and decrypt."""
+        if not data or data.get("vexlore_enc") != "mlkem512-fernet":
+            return data
+        try:
+            ct = base64.b64decode(data["kem_ct"])
+            shared = ML_KEM_512.decaps(self.kem_dk, ct)
+            f = shared_secret_to_fernet(shared)
+            plain = f.decrypt(base64.b64decode(data["ciphertext"]))
+            return json.loads(plain.decode())
+        except Exception as e:
+            print(f"  [!] KEM decrypt failed: {e}")
+            return None
+
+    def do_GET(self):
         path = urlparse(self.path).path.rstrip("/") or "/"
         if path == "/":
-            self._json_response(200, {"name": CHAIN_NAME, "version": VERSION, "blocks": len(self.chain.chain),
-                                      "difficulty": self.chain.current_difficulty, "mempool": len(self.chain.pending),
-                                      "peers": len(self.peers.peers)})
+            self._json(200, {"name": CHAIN_NAME, "version": VERSION, "blocks": len(self.chain.chain),
+                             "difficulty": self.chain.current_difficulty, "mempool": len(self.chain.pending),
+                             "peers": len(self.peers.peers), "kem": "ML-KEM-512"})
         elif path == "/chain":
-            self._json_response(200, {"length": len(self.chain.chain), "chain": [b.to_dict() for b in self.chain.chain]})
+            self._json(200, {"length": len(self.chain.chain), "chain": [b.to_dict() for b in self.chain.chain]})
         elif path == "/status":
-            self._json_response(200, {"version": VERSION, "blocks": len(self.chain.chain),
-                                      "difficulty": self.chain.current_difficulty, "last_hash": self.chain.last_block.hash,
-                                      "mempool": len(self.chain.pending), "peers": self.peers.list()})
+            self._json(200, {"version": VERSION, "blocks": len(self.chain.chain),
+                             "difficulty": self.chain.current_difficulty, "last_hash": self.chain.last_block.hash,
+                             "mempool": len(self.chain.pending), "peers": self.peers.list(),
+                             "kem_ek": self.kem_ek.hex()[:32] + "..."})
         elif path == "/peers":
-            self._json_response(200, {"peers": self.peers.list()})
+            self._json(200, {"peers": self.peers.list()})
         elif path in ("/pending", "/mempool"):
-            self._json_response(200, {"count": len(self.chain.pending), "pending": [t.to_dict() for t in self.chain.pending]})
+            self._json(200, {"count": len(self.chain.pending), "pending": [t.to_dict() for t in self.chain.pending]})
+        elif path == "/kem":
+            self._json(200, {"ek": self.kem_ek.hex(), "algo": "ML-KEM-512"})
         else:
-            self._json_response(404, {"error": "not found"})
+            self._json(404, {"error": "not found"})
 
-    def do_POST(self) -> None:
+    def do_POST(self):
         path = urlparse(self.path).path.rstrip("/") or "/"
-        data = self._read_json()
+        data = self._read()
         if path == "/block":
+            data = self._maybe_decrypt(data or {})
             if not data:
-                self._json_response(400, {"error": "no body"})
+                self._json(400, {"error": "bad body"})
                 return
             try:
                 block = Block.from_dict(data)
             except Exception:
-                self._json_response(400, {"error": "invalid block"})
+                self._json(400, {"error": "invalid block"})
                 return
             ok = self.chain.add_block_from_peer(block)
             if ok:
                 self.peers.broadcast_block(block)
-                self._json_response(200, {"status": "accepted"})
-            else:
-                self._json_response(409, {"status": "rejected"})
+            self._json(200 if ok else 409, {"status": "accepted" if ok else "rejected"})
         elif path == "/transaction":
+            data = self._maybe_decrypt(data or {})
             if not data:
-                self._json_response(400, {"error": "no body"})
+                self._json(400, {"error": "bad body"})
                 return
             try:
                 tx = Transaction.from_dict(data)
             except Exception:
-                self._json_response(400, {"error": "invalid tx"})
+                self._json(400, {"error": "invalid tx"})
                 return
             ok = self.chain.add_transaction(tx)
-            self._json_response(200 if ok else 409, {"status": "ok" if ok else "rejected"})
+            self._json(200 if ok else 409, {"status": "ok" if ok else "rejected"})
         elif path == "/peers":
             url = (data or {}).get("url", "")
             if url:
                 self.peers.add(url)
-                self._json_response(200, {"status": "added", "peers": self.peers.list()})
+                self._json(200, {"status": "added", "peers": self.peers.list()})
             else:
-                self._json_response(400, {"error": "url required"})
+                self._json(400, {"error": "url required"})
+        elif path == "/kem":
+            # peer is sending us their ek; reply with ours
+            their_ek_hex = (data or {}).get("ek", "")
+            their_url = (data or {}).get("url", "")
+            if their_ek_hex and their_url:
+                self.peers.peer_kem[their_url.rstrip("/")] = bytes.fromhex(their_ek_hex)
+                self.peers.add(their_url)
+                self.peers._save()
+            self._json(200, {"ek": self.kem_ek.hex(), "algo": "ML-KEM-512"})
         else:
-            self._json_response(404, {"error": "not found"})
+            self._json(404, {"error": "not found"})
 
 class NodeServer:
     def __init__(self, chain: VexloreChain, port: int = DEFAULT_PORT, host: str = "0.0.0.0"):
         self.chain = chain
         self.port = port
         self.host = host
-        local_ip = self._guess_local_ip()
+        # generate long-lived ML-KEM keypair for this node
+        self.kem_ek, self.kem_dk = ML_KEM_512.keygen()
+        local_ip = self._guess_ip()
         self.self_url = f"http://{local_ip}:{port}"
-        self.peers = PeerManager(self.self_url)
-        self._server: Optional[HTTPServer] = None
-        self._thread: Optional[threading.Thread] = None
-        self._sync_thread: Optional[threading.Thread] = None
+        self.peers = PeerManager(self.self_url, self.kem_ek)
+        self._server = None
         self._stop = threading.Event()
 
     @staticmethod
-    def _guess_local_ip() -> str:
+    def _guess_ip() -> str:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
@@ -935,52 +1081,60 @@ class NodeServer:
         except Exception:
             return "127.0.0.1"
 
-    def start(self) -> None:
-        handler = type("Handler", (NodeHTTPHandler,), {"chain": self.chain, "peers": self.peers})
+    def start(self):
+        handler = type("H", (NodeHTTPHandler,), {
+            "chain": self.chain, "peers": self.peers,
+            "kem_ek": self.kem_ek, "kem_dk": self.kem_dk,
+        })
         self._server = HTTPServer((self.host, self.port), handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
-        print(f"[+] Node listening on http://{self.host}:{self.port}")
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        print(f"[+] Node on http://{self.host}:{self.port}")
         print(f"    Self URL : {self.self_url}")
-        self._sync_thread = threading.Thread(target=self._sync_loop, daemon=True)
-        self._sync_thread.start()
-        print(f"[+] Background sync every {SYNC_INTERVAL}s")
+        print(f"    KEM      : ML-KEM-512 (ek {len(self.kem_ek)} bytes)")
+        threading.Thread(target=self._sync_loop, daemon=True).start()
 
-    def stop(self) -> None:
+    def stop(self):
         self._stop.set()
         if self._server:
             self._server.shutdown()
 
-    def _sync_loop(self) -> None:
+    def _sync_loop(self):
         while not self._stop.is_set():
             self.sync_with_peers()
             self._stop.wait(SYNC_INTERVAL)
 
-    def sync_with_peers(self) -> None:
+    def sync_with_peers(self):
         if not self.peers.peers:
             return
-        best_chain, best_len = None, len(self.chain.chain)
+        best, best_len = None, len(self.chain.chain)
         for peer in list(self.peers.peers):
             remote = self.peers.fetch_chain(peer)
             if remote and len(remote) > best_len and self.chain.is_valid(remote):
-                best_chain, best_len = remote, len(remote)
+                best, best_len = remote, len(remote)
             for p in self.peers.fetch_peers(peer):
                 self.peers.add(p)
             try:
                 requests.post(f"{peer}/peers", json={"url": self.self_url}, timeout=4)
             except Exception:
                 pass
-        if best_chain:
-            self.chain.replace_chain(best_chain)
+            # exchange KEM keys if we don't have theirs yet
+            if peer not in self.peers.peer_kem:
+                self.peers.exchange_kem(peer, self.kem_ek)
+        if best:
+            self.chain.replace_chain(best)
 
-    def add_peer(self, url: str) -> None:
+    def add_peer(self, url: str):
         if self.peers.add(url):
             try:
                 requests.post(f"{url.rstrip('/')}/peers", json={"url": self.self_url}, timeout=5)
             except Exception as e:
-                print(f"    (handshake failed: {e})")
+                print(f"    (handshake: {e})")
+            self.peers.exchange_kem(url.rstrip("/"), self.kem_ek)
             self.sync_with_peers()
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 def print_banner():
     print(r"""
  __     __        _                 
@@ -989,222 +1143,194 @@ def print_banner():
    \ V /  __/>  <| | (_) | | |  __/ 
     \_/ \___/_/\_\_|\___/|_|  \___| 
                                     
-  Quantumproof Chain  v0.4  — WALLET UPGRADES
-  Seed phrases • Encrypted wallets • Multi-address • History
-  Post-quantum signatures: ML-DSA-44 (FIPS 204)
+  Quantumproof Chain  v0.5  — POST-QUANTUM EXTRA
+  ML-KEM node encryption • Hybrid signatures • VEXQ addresses • Key rotation
 """)
 
 def main():
     print_banner()
     chain = VexloreChain()
-    wallet: Optional[Wallet] = None
-    default_path = WALLETS_DIR / "alice.json"
-    if default_path.exists():
-        print("[*] Found existing wallet 'alice'")
+    wallet = None
+    if (WALLETS_DIR / "alice.json").exists():
+        print("[*] Found wallet 'alice'")
         import getpass
-        pw = getpass.getpass("  Password to unlock (or Enter to skip): ")
+        pw = getpass.getpass("  Password (Enter to skip): ")
         if pw:
             wallet = Wallet("alice", password=pw)
             if not wallet._unlocked:
                 wallet = None
-    if wallet is None:
-        print("[*] No unlocked wallet yet. Use option 1 to create one.")
-    node: Optional[NodeServer] = None
+    if not wallet:
+        print("[*] Use option 1 to create a wallet")
+
+    node = None
     try:
-        node = NodeServer(chain, port=DEFAULT_PORT)
+        node = NodeServer(chain)
         node.start()
     except OSError as e:
-        print(f"[!] Could not bind port {DEFAULT_PORT}: {e}")
-        print("    Network features disabled until you free the port or change it.")
+        print(f"[!] Port {DEFAULT_PORT} busy: {e}")
         node = None
 
     while True:
-        addrs = len(wallet.addresses) if wallet and wallet._unlocked else 0
+        n_addr = len(wallet.list_addresses()) if wallet and wallet._unlocked else 0
         print(f"""
 Commands:
   1) New / Restore wallet     2) Unlock wallet
-  3) Show balance (fast)      4) Faucet (get coins)
+  3) Show balance             4) Faucet
   5) Send transaction         6) Mine block
   7) Show chain               8) Validate chain
-  9) List my addresses        10) New address
-  11) Transaction history     12) Lock wallet
-  13) Quit
+  9) List addresses           10) New address
+  11) History                 12) Rotate key
+  13) Lock wallet             14) Quit
 
 Network:
-  14) List peers              15) Add peer
-  16) Remove peer             17) Sync now
-  18) Node status             19) Start node (custom port)
+  15) List peers              16) Add peer
+  17) Remove peer             18) Sync now
+  19) Node status             20) Start node (custom port)
 
-Current: {len(chain.chain)} blocks | difficulty {chain.current_difficulty} | mempool {len(chain.pending)} | addresses {addrs}
+{len(chain.chain)} blocks | diff {chain.current_difficulty} | mempool {len(chain.pending)} | addrs {n_addr}
 """)
-        choice = input("Vexlore> ").strip()
-        if choice == "1":
-            name = input("Wallet name [alice]: ").strip() or "alice"
-            mode = input("  (n)ew or (r)estore from seed? [n]: ").strip().lower() or "n"
+        c = input("Vexlore> ").strip()
+        if c == "1":
+            name = input("Name [alice]: ").strip() or "alice"
+            mode = input("(n)ew / (r)estore [n]: ").strip().lower() or "n"
             import getpass
             if mode.startswith("r"):
-                print("Enter your 12-word seed phrase:")
-                mn = input("  > ").strip()
-                pw = getpass.getpass("  New password to encrypt this wallet: ")
+                mn = input("12-word seed: ").strip()
+                pw = getpass.getpass("New password: ")
                 try:
                     wallet = Wallet.restore(name, mn, pw)
                 except ValueError as e:
                     print(f"[-] {e}")
             else:
-                pw = getpass.getpass("  Password to encrypt the new wallet: ")
+                pw = getpass.getpass("Password: ")
                 wallet = Wallet(name, password=pw)
-        elif choice == "2":
-            name = input("Wallet name [alice]: ").strip() or "alice"
+        elif c == "2":
+            name = input("Name [alice]: ").strip() or "alice"
             import getpass
-            pw = getpass.getpass("  Password: ")
-            wallet = Wallet(name, password=pw)
-        elif choice == "3":
+            wallet = Wallet(name, password=getpass.getpass("Password: "))
+        elif c == "3":
             if not wallet or not wallet._unlocked:
-                print("[-] Unlock a wallet first")
-                continue
-            print("\n  Balances (fast O(1) lookup):")
+                print("[-] Unlock first"); continue
             for a in wallet.addresses:
-                bal = chain.get_balance(a["address"])
-                print(f"    #{a['index']:2d}  {a['address']}  →  {bal:.2f} VEX")
+                flag = " (rotated)" if a.get("rotated") else ""
+                print(f"  #{a['index']} v{a.get('version',0)}  {a['address']}  {chain.get_balance(a['address']):.2f} VEX{flag}")
             total = sum(chain.get_balance(a["address"]) for a in wallet.addresses)
-            print(f"  ─────────────────────────────\n  Total: {total:.2f} VEX")
-        elif choice == "4":
+            print(f"  Total: {total:.2f} VEX")
+        elif c == "4":
             if not wallet or not wallet._unlocked:
-                print("[-] Unlock a wallet first")
-                continue
-            amount = float(input("Amount [100]: ") or 100)
-            chain.faucet(wallet.address, amount)
-            print("Mine a block (option 6) to receive the coins.")
-        elif choice == "5":
+                print("[-] Unlock first"); continue
+            amt = float(input("Amount [100]: ") or 100)
+            chain.faucet(wallet.address, amt)
+            print("Mine (6) to receive")
+        elif c == "5":
             if not wallet or not wallet._unlocked:
-                print("[-] Unlock a wallet first")
-                continue
-            recipient = input("Recipient address: ").strip()
-            amount = float(input("Amount: "))
-            memo = input("Memo (optional): ").strip()
-            from_addr = input(f"From address [{wallet.address}]: ").strip() or wallet.address
+                print("[-] Unlock first"); continue
+            to = input("To: ").strip()
+            amt = float(input("Amount: "))
+            memo = input("Memo: ").strip()
+            frm = input(f"From [{wallet.address}]: ").strip() or wallet.address
             try:
-                tx = wallet.create_transaction(recipient, amount, memo, from_address=from_addr)
+                tx = wallet.create_transaction(to, amt, memo, frm)
                 if chain.add_transaction(tx):
-                    wallet.record_history(tx, direction="out")
-                    print("Transaction added to mempool. Mine a block to confirm.")
+                    wallet.record_history(tx, "out")
                     if node:
                         node.peers.broadcast_tx(tx)
             except Exception as e:
                 print(f"[-] {e}")
-        elif choice == "6":
+        elif c == "6":
             if not wallet or not wallet._unlocked:
-                print("[-] Unlock a wallet first")
-                continue
+                print("[-] Unlock first"); continue
             block = chain.mine_pending(wallet.address)
             if block:
                 for tx in block.transactions:
                     if tx.recipient in wallet.list_addresses() and tx.sender != "VEXLORE_NETWORK":
-                        wallet.record_history(tx, direction="in")
-                print(f"New primary balance: {chain.get_balance(wallet.address)} VEX")
+                        wallet.record_history(tx, "in")
+                print(f"Balance: {chain.get_balance(wallet.address)} VEX")
                 if node:
-                    print("[*] Broadcasting block to peers ...")
                     node.peers.broadcast_block(block)
-        elif choice == "7":
+        elif c == "7":
             print(f"\n=== {CHAIN_NAME} ({len(chain.chain)} blocks) ===")
             for b in chain.chain:
-                print(f"\nBlock #{b.index}  {b.hash[:20]}...  (diff={b.difficulty})")
-                print(f"  Prev : {b.previous_hash[:20]}...\n  Nonce: {b.nonce}  Miner: {b.miner[:16]}...")
+                print(f"\n#{b.index}  {b.hash[:18]}...  diff={b.difficulty}  miner={b.miner[:12]}")
                 for t in b.transactions:
-                    print(f"    TX {t.tx_id[:8]}  {t.amount} VEX  {t.sender[:12]} → {t.recipient[:12]}")
-        elif choice == "8":
-            start = time.time()
-            valid = chain.is_valid()
-            print(f"Chain valid: {valid}  (checked in {time.time()-start:.3f}s)")
-        elif choice == "9":
+                    print(f"  {t.amount} VEX  {t.sender[:12]} → {t.recipient[:12]}")
+        elif c == "8":
+            t0 = time.time()
+            print(f"Valid: {chain.is_valid()}  ({time.time()-t0:.3f}s)")
+        elif c == "9":
             if not wallet or not wallet._unlocked:
-                print("[-] Unlock a wallet first")
-                continue
-            print(f"\n  Addresses in wallet '{wallet.name}':")
+                print("[-] Unlock first"); continue
             for a in wallet.addresses:
-                bal = chain.get_balance(a["address"])
-                print(f"    #{a['index']:2d}  {a['address']}  ({bal:.2f} VEX)")
-        elif choice == "10":
+                flag = " [rotated]" if a.get("rotated") else ""
+                print(f"  #{a['index']} v{a.get('version',0)}  {a['address']}{flag}")
+        elif c == "10":
             if not wallet or not wallet._unlocked:
-                print("[-] Unlock a wallet first")
-                continue
+                print("[-] Unlock first"); continue
             wallet.new_address()
-        elif choice == "11":
+        elif c == "11":
             if not wallet or not wallet._unlocked:
-                print("[-] Unlock a wallet first")
-                continue
+                print("[-] Unlock first"); continue
             wallet.show_history()
-            more = input("  Scan whole chain for more history? [y/N]: ").strip().lower()
-            if more == "y":
-                addrs = set(wallet.list_addresses())
-                found = chain.scan_history_for(addrs)
-                print(f"\n  Found {len(found)} transactions on-chain:")
-                for h in found[-30:]:
-                    ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(h["timestamp"]))
-                    print(f"    blk#{h['block']}  {ts}  {h['amount']} VEX  {h['sender'][:10]} → {h['recipient'][:10]}")
-        elif choice == "12":
+        elif c == "12":
+            if not wallet or not wallet._unlocked:
+                print("[-] Unlock first"); continue
+            addr = input(f"Address to rotate [{wallet.address}]: ").strip() or wallet.address
+            try:
+                wallet.rotate_key(addr)
+            except Exception as e:
+                print(f"[-] {e}")
+        elif c == "13":
             if wallet and wallet._unlocked:
-                wallet.lock()
-                wallet = None
+                wallet.lock(); wallet = None
             else:
-                print("[-] No unlocked wallet")
-        elif choice in ("13", "q", "quit", "exit"):
+                print("[-] Nothing to lock")
+        elif c in ("14", "q", "quit", "exit"):
             if node:
                 node.stop()
-            print("Goodbye from Vexlore.")
+            print("Bye from Vexlore v0.5")
             break
-        elif choice == "14":
+        elif c == "15":
             if not node:
-                print("[-] Node not running")
-                continue
-            peers = node.peers.list()
-            print("No peers yet. Use option 15 to add one." if not peers else f"Known peers ({len(peers)}):")
-            for p in peers:
-                print(f"  • {p}")
-        elif choice == "15":
+                print("[-] No node"); continue
+            for p in node.peers.list():
+                kem = "KEM✓" if p in node.peers.peer_kem else "plain"
+                print(f"  • {p}  [{kem}]")
+        elif c == "16":
             if not node:
-                print("[-] Node not running – start it first (option 19)")
-                continue
-            url = input("Peer URL (e.g. http://192.168.1.10:5000): ").strip()
+                print("[-] Start node first"); continue
+            url = input("Peer URL: ").strip()
             if url:
                 node.add_peer(url)
-        elif choice == "16":
+        elif c == "17":
             if not node:
-                print("[-] Node not running")
-                continue
-            url = input("Peer URL to remove: ").strip()
-            node.peers.remove(url)
-        elif choice == "17":
+                print("[-] No node"); continue
+            node.peers.remove(input("URL: ").strip())
+        elif c == "18":
             if not node:
-                print("[-] Node not running")
-                continue
-            print("[*] Syncing with peers ...")
+                print("[-] No node"); continue
             node.sync_with_peers()
-            print(f"[+] Local chain now has {len(chain.chain)} blocks")
-        elif choice == "18":
+            print(f"[+] Chain length {len(chain.chain)}")
+        elif c == "19":
             if not node:
-                print("[-] Node not running")
-                continue
-            print(f"Self URL     : {node.self_url}\nBlocks       : {len(chain.chain)}\nDifficulty   : {chain.current_difficulty}")
-            print(f"Last hash    : {chain.last_block.hash[:24]}...\nMempool      : {len(chain.pending)} txs")
-            print(f"Peers        : {len(node.peers.peers)}\nVersion      : {VERSION}")
-        elif choice == "19":
+                print("[-] No node"); continue
+            print(f"Self     : {node.self_url}")
+            print(f"Blocks   : {len(chain.chain)}")
+            print(f"Diff     : {chain.current_difficulty}")
+            print(f"Mempool  : {len(chain.pending)}")
+            print(f"Peers    : {len(node.peers.peers)}")
+            print(f"KEM peers: {len(node.peers.peer_kem)}")
+            print(f"Version  : {VERSION}")
+        elif c == "20":
             if node:
-                print(f"[!] Node already running on port {node.port}")
-                continue
+                print(f"[!] Already on {node.port}"); continue
             try:
-                port = int(input(f"Port [{DEFAULT_PORT}]: ").strip() or DEFAULT_PORT)
-            except ValueError:
-                print("Invalid port")
-                continue
-            try:
+                port = int(input(f"Port [{DEFAULT_PORT}]: ") or DEFAULT_PORT)
                 node = NodeServer(chain, port=port)
                 node.start()
-            except OSError as e:
-                print(f"[-] Could not start: {e}")
-                node = None
+            except Exception as e:
+                print(f"[-] {e}"); node = None
         else:
-            print("Unknown command")
+            print("Unknown")
 
 if __name__ == "__main__":
     main()

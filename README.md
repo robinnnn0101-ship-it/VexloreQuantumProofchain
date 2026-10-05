@@ -2,32 +2,26 @@
 
 **Free educational post-quantum blockchain** named **Vexlore**.
 
-Uses real **ML-DSA-44** (NIST FIPS 204 / Dilithium) signatures — resistant to known quantum attacks (Shor’s algorithm).
+Uses real **ML-DSA-44** (FIPS 204) + **ML-KEM-512** (FIPS 203) + hybrid Ed25519 signatures.
 
-> Not production-ready. This is a clean, runnable prototype you can study, extend, and play with locally.
+> Not production-ready. Clean, runnable prototype for learning.
 
 ## Version History
 
 | Version | Focus |
 |---------|--------|
-| **v0.1** | Core chain, wallets, PoW, ML-DSA signatures |
-| **v0.2** | NETWORK — multi-node, peer list, block/tx gossip, auto-sync |
-| **v0.3** | BETTER CHAIN — adaptive difficulty, bigger blocks, better mempool, atomic saves, faster validation |
-| **v0.4** | WALLET UPGRADES — seed phrase backup, encrypted wallet files, multiple addresses, transaction history, fast balance |
+| **v0.1** | Core chain, wallets, PoW, ML-DSA |
+| **v0.2** | NETWORK — multi-node, gossip, auto-sync |
+| **v0.3** | BETTER CHAIN — adaptive difficulty, bigger blocks, atomic saves |
+| **v0.4** | WALLET UPGRADES — seed phrase, encrypted wallets, multi-address, history |
+| **v0.5** | POST-QUANTUM EXTRA — ML-KEM node encryption, hybrid signatures, VEXQ addresses, key rotation |
 
-## Features (v0.4)
+## What’s new in v0.5
 
-- Post-quantum digital signatures (ML-DSA-44)
-- Proof-of-Work mining with **adaptive difficulty**
-- **Seed-phrase wallets** (12-word BIP-39 style mnemonic)
-- **Encrypted wallet files** (password + PBKDF2 + Fernet)
-- **Multiple addresses** from one seed (HD-style derivation)
-- Transaction history (local + full-chain scan)
-- Fast O(1) balance checks
-- Simple balances + faucet for testing
-- Persistent chain stored as JSON (atomic / crash-safe)
-- Better mempool + bigger blocks (up to 50 txs)
-- **Networking** — HTTP peer API, peer list, auto-sync, block & tx gossip
+- **ML-KEM-512** for encrypted peer-to-peer messages (block/tx gossip)
+- **Hybrid signatures** — every transaction is signed with both Ed25519 *and* ML-DSA-44
+- **Quantum-safe addresses** start with `VEXQ...` (hash of both public keys)
+- **Key rotation** — rotate keys for any address while keeping the old one usable for receiving
 
 ## Quick Start
 
@@ -36,44 +30,30 @@ pip install requests cryptography
 python3 vexlore_chain.py
 ```
 
-### First-time walkthrough
+You need both folders next to the script:
+- `dilithium_src/`  (ML-DSA)
+- `kyber_src/`      (ML-KEM)
 
-1. Choose **1** → create a new wallet  
-   - Type a name (or just press Enter for “alice”)  
-   - Choose a password  
-   - **Write down the 12 words** that appear! This is your only backup.
+### First run
 
-2. Choose **4** → Faucet → get free test coins  
-3. Choose **6** → Mine a block → coins arrive  
-4. Choose **3** → See your balance (instant)  
-5. Choose **10** → Create extra addresses anytime  
-6. Choose **5** → Send coins  
-7. Choose **11** → See transaction history  
-
-### Restore from seed phrase
-
-```
-1 → (r)estore
-Paste your 12 words
-Choose a new password
-```
+1. Option **1** → create wallet → write down the 12 words  
+2. Option **4** → faucet  
+3. Option **6** → mine  
+4. Option **3** → see balance  
+5. Option **12** → try key rotation  
+6. Option **16** → add a peer (KEM keys are exchanged automatically)
 
 ## Folder layout
 
 ```
 vexlore/
-├── vexlore_chain.py      ← main program (v0.4)
-├── demo.py               ← non-interactive demo
+├── vexlore_chain.py
+├── demo.py
 ├── README.md
-├── dilithium_src/        ← pure-Python ML-DSA
-├── wallet/               ← encrypted wallet files
-└── data/                 ← chain + peers
+├── dilithium_src/     ← ML-DSA-44
+├── kyber_src/         ← ML-KEM-512
+├── wallet/            ← encrypted wallets
+└── data/              ← chain + peers
 ```
 
-## Security notes (educational)
-
-- Seed phrase = full control of the wallet. Never share it.
-- Wallet file is encrypted; without the password the secrets stay safe.
-- This is **not** production software. Do not put real money on it.
-
-Have fun exploring post-quantum crypto!
+Educational only — do not put real money on it.
