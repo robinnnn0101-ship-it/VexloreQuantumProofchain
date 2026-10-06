@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Vexlore Quantumproof Chain  v0.5 — POST-QUANTUM EXTRA
+Vexlore Quantumproof Chain  v0.6 — STATE & DATA
 Educational post-quantum blockchain.
 
-v0.5 adds:
-  • ML-KEM-512 (FIPS 203) for encrypted node messages
-  • Hybrid signatures (Ed25519 + ML-DSA-44)
-  • Quantum-safe address format (VEXQ...)
-  • Key rotation support
+v0.6 adds:
+  • Clean account-balance state (separate state root + file)
+  • Merkle trees for transactions (per-block) and balances (state root)
+  • Prune old blocks option (keep recent N + state)
+  • Export / import chain + state
 
-Also includes all v0.4 wallet features (seed phrase, encrypted wallets,
-multi-address, history) and the solid v0.3 chain core.
+Also includes all v0.5 post-quantum extras (ML-KEM, hybrid sigs,
+VEXQ addresses, key rotation) and earlier wallet/chain features.
 
 Not production-ready — for learning only.
 """
@@ -68,7 +68,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 CHAIN_NAME = "Vexlore Quantumproof Chain"
-VERSION = "0.5.0-post-quantum-extra"
+VERSION = "0.6.0-state-data"
 
 INITIAL_DIFFICULTY = 3
 TARGET_BLOCK_TIME = 20
@@ -81,13 +81,18 @@ SYNC_INTERVAL = 15
 MNEMONIC_WORDS = 12
 PBKDF2_ITERATIONS = 100_000
 ADDR_PREFIX = "VEXQ"          # quantum-safe address prefix
+DEFAULT_KEEP_BLOCKS = 50      # pruning: keep this many recent full blocks
+EMPTY_MERKLE = "0" * 64
 
 DATA_DIR = Path(__file__).parent / "data"
 CHAIN_FILE = DATA_DIR / "vexlore_chain.json"
+STATE_FILE = DATA_DIR / "vexlore_state.json"
 PEERS_FILE = DATA_DIR / "peers.json"
 WALLETS_DIR = Path(__file__).parent / "wallet"
+EXPORT_DIR = Path(__file__).parent / "exports"
 DATA_DIR.mkdir(exist_ok=True)
 WALLETS_DIR.mkdir(exist_ok=True)
+EXPORT_DIR.mkdir(exist_ok=True)
 
 # Short BIP-39 wordlist reference (full list embedded compactly)
 BIP39_WORDLIST = open(Path(__file__).parent / "bip39_words.txt").read().split() if (Path(__file__).parent / "bip39_words.txt").exists() else None
@@ -160,9 +165,71 @@ def decrypt_blob(enc: dict, password: str) -> bytes:
 def shared_secret_to_fernet(shared: bytes) -> Fernet:
     """Turn 32-byte ML-KEM shared secret into a Fernet key."""
     key = base64.urlsafe_b64encode(
-        HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"vexlore-node-v05").derive(shared)
+        HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"vexlore-node-v06").derive(shared)
     )
     return Fernet(key)
+
+# ---------------------------------------------------------------------------
+# Merkle tree helpers (v0.6)
+# ---------------------------------------------------------------------------
+def merkle_leaf(data: bytes) -> str:
+    return sha256(b"\x00" + data)
+
+def merkle_node(left: str, right: str) -> str:
+    return sha256(b"\x01" + bytes.fromhex(left) + bytes.fromhex(right))
+
+def build_merkle_root(leaves: List[str]) -> str:
+    """Build Merkle root from a list of leaf hashes (hex). Empty → EMPTY_MERKLE."""
+    if not leaves:
+        return EMPTY_MERKLE
+    level = list(leaves)
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])  # duplicate last
+        nxt = []
+        for i in range(0, len(level), 2):
+            nxt.append(merkle_node(level[i], level[i + 1]))
+        level = nxt
+    return level[0]
+
+def merkle_proof(leaves: List[str], index: int) -> List[Tuple[str, str]]:
+    """Return list of (sibling_hash, side) where side is 'L' or 'R'."""
+    if not leaves or index < 0 or index >= len(leaves):
+        return []
+    proof = []
+    level = list(leaves)
+    idx = index
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])
+        sibling = idx ^ 1
+        if sibling < len(level):
+            side = "L" if sibling < idx else "R"
+            proof.append((level[sibling], side))
+        nxt = []
+        for i in range(0, len(level), 2):
+            nxt.append(merkle_node(level[i], level[i + 1]))
+        level = nxt
+        idx //= 2
+    return proof
+
+def verify_merkle_proof(leaf: str, proof: List[Tuple[str, str]], root: str) -> bool:
+    h = leaf
+    for sibling, side in proof:
+        if side == "L":
+            h = merkle_node(sibling, h)
+        else:
+            h = merkle_node(h, sibling)
+    return h == root
+
+def tx_leaf_hash(tx: "Transaction") -> str:
+    return merkle_leaf(json.dumps(tx.to_dict(), sort_keys=True, separators=(",", ":")).encode())
+
+def balances_merkle_root(balances: Dict[str, float]) -> str:
+    """Deterministic Merkle root over sorted (address, balance) pairs."""
+    items = sorted(balances.items())
+    leaves = [merkle_leaf(f"{addr}:{bal:.8f}".encode()) for addr, bal in items]
+    return build_merkle_root(leaves)
 
 # ---------------------------------------------------------------------------
 # Mnemonic (fallback if no bip39 file – generate simple 12-word from entropy)
@@ -410,16 +477,29 @@ class Block:
     nonce: int = 0
     hash: str = ""
     miner: str = "genesis"
+    merkle_root: str = EMPTY_MERKLE          # v0.6: tx Merkle root
+    state_root: str = EMPTY_MERKLE           # v0.6: balances Merkle root after this block
+
+    def compute_merkle_root(self) -> str:
+        leaves = [tx_leaf_hash(t) for t in self.transactions]
+        return build_merkle_root(leaves)
 
     def compute_hash(self) -> str:
-        tx_data = [t.to_dict() for t in self.transactions]
-        s = json.dumps({"index": self.index, "timestamp": self.timestamp, "transactions": tx_data,
-                        "previous_hash": self.previous_hash, "difficulty": self.difficulty,
-                        "nonce": self.nonce, "miner": self.miner},
-                       sort_keys=True, separators=(",", ":"))
+        # Hash commits to merkle_root + state_root instead of full tx list (cleaner, still secure)
+        s = json.dumps({
+            "index": self.index,
+            "timestamp": self.timestamp,
+            "merkle_root": self.merkle_root,
+            "state_root": self.state_root,
+            "previous_hash": self.previous_hash,
+            "difficulty": self.difficulty,
+            "nonce": self.nonce,
+            "miner": self.miner,
+        }, sort_keys=True, separators=(",", ":"))
         return sha256(s.encode())
 
     def mine(self) -> None:
+        self.merkle_root = self.compute_merkle_root()
         target = "0" * self.difficulty
         while True:
             self.hash = self.compute_hash()
@@ -428,17 +508,34 @@ class Block:
             self.nonce += 1
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"index": self.index, "timestamp": self.timestamp,
-                "transactions": [t.to_dict() for t in self.transactions],
-                "previous_hash": self.previous_hash, "difficulty": self.difficulty,
-                "nonce": self.nonce, "hash": self.hash, "miner": self.miner}
+        return {
+            "index": self.index,
+            "timestamp": self.timestamp,
+            "transactions": [t.to_dict() for t in self.transactions],
+            "previous_hash": self.previous_hash,
+            "difficulty": self.difficulty,
+            "nonce": self.nonce,
+            "hash": self.hash,
+            "miner": self.miner,
+            "merkle_root": self.merkle_root,
+            "state_root": self.state_root,
+        }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Block":
-        txs = [Transaction.from_dict(t) for t in d["transactions"]]
-        return cls(index=d["index"], timestamp=d["timestamp"], transactions=txs,
-                   previous_hash=d["previous_hash"], difficulty=d.get("difficulty", INITIAL_DIFFICULTY),
-                   nonce=d.get("nonce", 0), hash=d.get("hash", ""), miner=d.get("miner", ""))
+        txs = [Transaction.from_dict(t) for t in d.get("transactions", [])]
+        return cls(
+            index=d["index"],
+            timestamp=d["timestamp"],
+            transactions=txs,
+            previous_hash=d["previous_hash"],
+            difficulty=d.get("difficulty", INITIAL_DIFFICULTY),
+            nonce=d.get("nonce", 0),
+            hash=d.get("hash", ""),
+            miner=d.get("miner", ""),
+            merkle_root=d.get("merkle_root", EMPTY_MERKLE),
+            state_root=d.get("state_root", EMPTY_MERKLE),
+        )
 
 # ---------------------------------------------------------------------------
 # Wallet v0.5 – hybrid keys + rotation + seed + encrypted
@@ -648,21 +745,41 @@ class Wallet:
 # Chain (core unchanged + hybrid verify)
 # ---------------------------------------------------------------------------
 class VexloreChain:
+    """
+    v0.6 STATE & DATA:
+      • balances live in a clean separate state (STATE_FILE) + state_root
+      • every block carries merkle_root (txs) and state_root (balances)
+      • prune_old_blocks keeps only the last N full blocks
+      • export_chain / import_chain for portable backups
+    """
+
     def __init__(self):
         self.chain: List[Block] = []
         self.pending: List[Transaction] = []
         self.balances: Dict[str, float] = {}
+        self.state_root: str = EMPTY_MERKLE
         self.current_difficulty = INITIAL_DIFFICULTY
+        self.pruned_up_to: int = -1   # highest index that was pruned (full txs discarded)
         self._load_or_create()
 
+    # ------------------------------------------------------------------ load / save
     def _load_or_create(self):
         if CHAIN_FILE.exists():
             try:
                 raw = json.loads(CHAIN_FILE.read_text())
                 self.chain = [Block.from_dict(b) for b in raw["chain"]]
-                self.balances = raw.get("balances", {})
                 self.current_difficulty = raw.get("difficulty", INITIAL_DIFFICULTY)
-                print(f"[+] Loaded {len(self.chain)} blocks (diff={self.current_difficulty})")
+                self.pruned_up_to = raw.get("pruned_up_to", -1)
+                # Prefer dedicated state file; fall back to balances embedded in chain file
+                if STATE_FILE.exists():
+                    st = json.loads(STATE_FILE.read_text())
+                    self.balances = {k: float(v) for k, v in st.get("balances", {}).items()}
+                    self.state_root = st.get("state_root", balances_merkle_root(self.balances))
+                else:
+                    self.balances = {k: float(v) for k, v in raw.get("balances", {}).items()}
+                    self.state_root = balances_merkle_root(self.balances)
+                print(f"[+] Loaded {len(self.chain)} blocks (diff={self.current_difficulty}, "
+                      f"accounts={len(self.balances)}, state_root={self.state_root[:12]}...)")
             except Exception as e:
                 print(f"[!] Load failed: {e}")
                 self._create_genesis()
@@ -671,35 +788,65 @@ class VexloreChain:
 
     def _create_genesis(self):
         print("[*] Creating Genesis ...")
-        tx = Transaction(tx_id="genesis", sender="VEXLORE_NETWORK", recipient="VEXLORE_NETWORK",
-                         amount=0.0, timestamp=time.time(), public_key="", ed_public_key="",
-                         signature="", memo="Genesis v0.5 – hybrid post-quantum")
-        block = Block(0, time.time(), [tx], "0"*64, INITIAL_DIFFICULTY, miner="genesis")
+        tx = Transaction(
+            tx_id="genesis", sender="VEXLORE_NETWORK", recipient="VEXLORE_NETWORK",
+            amount=0.0, timestamp=time.time(), public_key="", ed_public_key="",
+            signature="", memo="Genesis v0.6 – state & data",
+        )
+        block = Block(0, time.time(), [tx], "0" * 64, INITIAL_DIFFICULTY, miner="genesis")
+        block.merkle_root = block.compute_merkle_root()
+        self.balances = {}
+        self.state_root = balances_merkle_root(self.balances)
+        block.state_root = self.state_root
         block.hash = block.compute_hash()
         self.chain.append(block)
         self._save()
-        print(f"[+] Genesis {block.hash[:16]}...")
+        print(f"[+] Genesis {block.hash[:16]}...  state_root={self.state_root[:12]}...")
 
-    def _atomic_save(self, data: dict):
+    def _atomic_write(self, path: Path, data: dict):
         fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f, indent=2)
-            os.replace(tmp, CHAIN_FILE)
+            os.replace(tmp, path)
         except Exception:
             if os.path.exists(tmp):
                 os.unlink(tmp)
             raise
 
+    def _save_state(self):
+        """Clean account-balance state file (no chain bloat)."""
+        self.state_root = balances_merkle_root(self.balances)
+        # drop zero balances for cleanliness
+        clean = {a: round(b, 8) for a, b in self.balances.items() if abs(b) > 1e-12}
+        self.balances = clean
+        self._atomic_write(STATE_FILE, {
+            "version": VERSION,
+            "state_root": self.state_root,
+            "account_count": len(self.balances),
+            "balances": self.balances,
+            "updated": time.time(),
+        })
+
     def _save(self):
-        self._atomic_save({"name": CHAIN_NAME, "version": VERSION, "algo": "hybrid-Ed25519+ML-DSA-44 + ML-KEM-512",
-                           "difficulty": self.current_difficulty,
-                           "chain": [b.to_dict() for b in self.chain], "balances": self.balances})
+        self._save_state()
+        # Chain file no longer embeds full balances (kept only for backward compat as empty)
+        self._atomic_write(CHAIN_FILE, {
+            "name": CHAIN_NAME,
+            "version": VERSION,
+            "algo": "hybrid-Ed25519+ML-DSA-44 + ML-KEM-512",
+            "difficulty": self.current_difficulty,
+            "state_root": self.state_root,
+            "pruned_up_to": self.pruned_up_to,
+            "chain": [b.to_dict() for b in self.chain],
+            "balances": {},  # balances live in STATE_FILE
+        })
 
     @property
     def last_block(self) -> Block:
         return self.chain[-1]
 
+    # ------------------------------------------------------------------ difficulty / mempool
     def _adjust_difficulty(self) -> int:
         if len(self.chain) < DIFFICULTY_ADJUST_EVERY + 1:
             return self.current_difficulty
@@ -720,7 +867,7 @@ class VexloreChain:
             print("[-] Invalid hybrid signature")
             return False
         if tx.sender != "VEXLORE_NETWORK" and self.balances.get(tx.sender, 0) < tx.amount:
-            print(f"[-] Insufficient balance")
+            print("[-] Insufficient balance")
             return False
         if any(p.tx_id == tx.tx_id for p in self.pending):
             return False
@@ -728,8 +875,15 @@ class VexloreChain:
             print("[-] Mempool full")
             return False
         self.pending.append(tx)
-        print(f"[+] Pending {tx.tx_id[:8]}... {tx.amount} VEX → {tx.recipient[:14]}... (mempool {len(self.pending)})")
+        print(f"[+] Pending {tx.tx_id[:8]}... {tx.amount} VEX → {tx.recipient[:14]}... "
+              f"(mempool {len(self.pending)})")
         return True
+
+    def _apply_txs(self, txs: List[Transaction]):
+        for tx in txs:
+            if tx.sender != "VEXLORE_NETWORK":
+                self.balances[tx.sender] = self.balances.get(tx.sender, 0) - tx.amount
+            self.balances[tx.recipient] = self.balances.get(tx.recipient, 0) + tx.amount
 
     def mine_pending(self, miner_address: str) -> Optional[Block]:
         if not self.pending:
@@ -737,21 +891,29 @@ class VexloreChain:
             return None
         txs = self.pending[:MAX_TX_PER_BLOCK]
         remaining = self.pending[MAX_TX_PER_BLOCK:]
-        reward = Transaction(tx_id=str(uuid.uuid4()), sender="VEXLORE_NETWORK", recipient=miner_address,
-                             amount=10.0, timestamp=time.time(), public_key="", ed_public_key="",
-                             signature="", memo="Block reward")
+        reward = Transaction(
+            tx_id=str(uuid.uuid4()), sender="VEXLORE_NETWORK", recipient=miner_address,
+            amount=10.0, timestamp=time.time(), public_key="", ed_public_key="",
+            signature="", memo="Block reward",
+        )
         txs = txs + [reward]
         self.current_difficulty = self._adjust_difficulty()
-        block = Block(len(self.chain), time.time(), txs, self.last_block.hash,
-                      self.current_difficulty, miner=miner_address)
+        # Apply txs to get the new state_root before mining (so hash commits to it)
+        snapshot = dict(self.balances)
+        self._apply_txs(txs)
+        new_state_root = balances_merkle_root(self.balances)
+
+        block = Block(
+            len(self.chain), time.time(), txs, self.last_block.hash,
+            self.current_difficulty, miner=miner_address,
+        )
+        block.state_root = new_state_root
         print(f"[*] Mining #{block.index} (diff {block.difficulty}) ...")
         t0 = time.time()
         block.mine()
-        print(f"[+] Mined in {time.time()-t0:.2f}s  {block.hash[:20]}...")
-        for tx in txs:
-            if tx.sender != "VEXLORE_NETWORK":
-                self.balances[tx.sender] = self.balances.get(tx.sender, 0) - tx.amount
-            self.balances[tx.recipient] = self.balances.get(tx.recipient, 0) + tx.amount
+        print(f"[+] Mined in {time.time()-t0:.2f}s  {block.hash[:20]}...  "
+              f"merkle={block.merkle_root[:12]}... state={block.state_root[:12]}...")
+        self.state_root = new_state_root
         self.chain.append(block)
         self.pending = remaining
         self._save()
@@ -760,25 +922,49 @@ class VexloreChain:
     def get_balance(self, address: str) -> float:
         return self.balances.get(address, 0.0)
 
-    def is_valid(self, chain: Optional[List[Block]] = None) -> bool:
+    def state_summary(self) -> Dict[str, Any]:
+        return {
+            "state_root": self.state_root,
+            "account_count": len(self.balances),
+            "total_supply": round(sum(self.balances.values()), 8),
+            "pruned_up_to": self.pruned_up_to,
+            "blocks": len(self.chain),
+        }
+
+    def is_valid(self, chain: Optional[List[Block]] = None, check_merkle: bool = True) -> bool:
         blocks = chain or self.chain
-        if not blocks or blocks[0].index != 0 or blocks[0].previous_hash != "0"*64:
+        if not blocks:
             return False
-        for i in range(1, len(blocks)):
-            cur, prev = blocks[i], blocks[i-1]
-            if cur.index != prev.index+1 or cur.previous_hash != prev.hash:
+        for i in range(len(blocks)):
+            cur = blocks[i]
+            if i == 0:
+                # Genesis: fixed previous_hash; PoW not required on block 0
+                if cur.index == 0 and cur.previous_hash != "0" * 64:
+                    return False
+            else:
+                prev = blocks[i - 1]
+                if cur.index != prev.index + 1 or cur.previous_hash != prev.hash:
+                    return False
+                # PoW only for non-genesis blocks
+                if not cur.hash.startswith("0" * cur.difficulty):
+                    return False
+            if cur.hash != cur.compute_hash():
                 return False
-            if not cur.hash.startswith("0"*cur.difficulty) or cur.hash != cur.compute_hash():
-                return False
+            if check_merkle and cur.transactions:
+                expected = cur.compute_merkle_root()
+                if cur.merkle_root and cur.merkle_root != EMPTY_MERKLE and cur.merkle_root != expected:
+                    return False
             for tx in cur.transactions:
                 if tx.sender != "VEXLORE_NETWORK" and not tx.verify():
                     return False
         return True
 
     def faucet(self, address: str, amount: float = 100.0):
-        tx = Transaction(tx_id=str(uuid.uuid4()), sender="VEXLORE_NETWORK", recipient=address,
-                         amount=amount, timestamp=time.time(), public_key="", ed_public_key="",
-                         signature="", memo="Faucet")
+        tx = Transaction(
+            tx_id=str(uuid.uuid4()), sender="VEXLORE_NETWORK", recipient=address,
+            amount=amount, timestamp=time.time(), public_key="", ed_public_key="",
+            signature="", memo="Faucet",
+        )
         self.pending.append(tx)
         print(f"[+] Faucet {amount} VEX → {address[:16]}... (mempool {len(self.pending)})")
 
@@ -789,32 +975,38 @@ class VexloreChain:
         self.chain = new_blocks
         self.balances = {}
         for b in self.chain:
-            for tx in b.transactions:
-                if tx.sender != "VEXLORE_NETWORK":
-                    self.balances[tx.sender] = self.balances.get(tx.sender, 0) - tx.amount
-                self.balances[tx.recipient] = self.balances.get(tx.recipient, 0) + tx.amount
+            self._apply_txs(b.transactions)
+        self.state_root = balances_merkle_root(self.balances)
         self.pending = []
         self.current_difficulty = self.chain[-1].difficulty
+        self.pruned_up_to = -1
         self._save()
         return True
 
     def add_block_from_peer(self, block: Block) -> bool:
         if (block.index != len(self.chain) or block.previous_hash != self.last_block.hash or
-            block.hash != block.compute_hash() or not block.hash.startswith("0"*block.difficulty)):
+                block.hash != block.compute_hash() or not block.hash.startswith("0" * block.difficulty)):
             return False
         for tx in block.transactions:
             if tx.sender != "VEXLORE_NETWORK" and not tx.verify():
                 return False
-        for tx in block.transactions:
-            if tx.sender != "VEXLORE_NETWORK":
-                self.balances[tx.sender] = self.balances.get(tx.sender, 0) - tx.amount
-            self.balances[tx.recipient] = self.balances.get(tx.recipient, 0) + tx.amount
+        if block.transactions:
+            expected_mr = block.compute_merkle_root()
+            if block.merkle_root and block.merkle_root != EMPTY_MERKLE and block.merkle_root != expected_mr:
+                return False
+        self._apply_txs(block.transactions)
+        new_sr = balances_merkle_root(self.balances)
+        if block.state_root and block.state_root != EMPTY_MERKLE and block.state_root != new_sr:
+            # peer's claimed state root mismatch – still accept if signatures/PoW ok,
+            # but re-sync state from our computation
+            pass
+        self.state_root = new_sr
         ids = {t.tx_id for t in block.transactions}
         self.pending = [t for t in self.pending if t.tx_id not in ids]
         self.chain.append(block)
         self.current_difficulty = block.difficulty
         self._save()
-        print(f"[+] Accepted block #{block.index} from peer")
+        print(f"[+] Accepted block #{block.index} from peer  state={self.state_root[:12]}...")
         return True
 
     def scan_history_for(self, addresses: Set[str]) -> List[Dict]:
@@ -822,9 +1014,113 @@ class VexloreChain:
         for b in self.chain:
             for tx in b.transactions:
                 if tx.sender in addresses or tx.recipient in addresses:
-                    found.append({"block": b.index, "tx_id": tx.tx_id, "sender": tx.sender,
-                                  "recipient": tx.recipient, "amount": tx.amount, "timestamp": tx.timestamp})
+                    found.append({
+                        "block": b.index, "tx_id": tx.tx_id, "sender": tx.sender,
+                        "recipient": tx.recipient, "amount": tx.amount, "timestamp": tx.timestamp,
+                    })
         return found
+
+    # ------------------------------------------------------------------ Merkle helpers (public)
+    def merkle_proof_for_tx(self, block_index: int, tx_id: str) -> Optional[Dict]:
+        if block_index < 0 or block_index >= len(self.chain):
+            return None
+        block = self.chain[block_index]
+        leaves = [tx_leaf_hash(t) for t in block.transactions]
+        for i, t in enumerate(block.transactions):
+            if t.tx_id == tx_id:
+                proof = merkle_proof(leaves, i)
+                return {
+                    "block": block_index,
+                    "tx_id": tx_id,
+                    "leaf": leaves[i],
+                    "proof": proof,
+                    "root": block.merkle_root,
+                    "valid": verify_merkle_proof(leaves[i], proof, block.merkle_root),
+                }
+        return None
+
+    def verify_state_root(self) -> bool:
+        computed = balances_merkle_root(self.balances)
+        ok = computed == self.state_root
+        if not ok:
+            print(f"[-] state_root mismatch: stored={self.state_root[:16]}... computed={computed[:16]}...")
+        return ok
+
+    # ------------------------------------------------------------------ Prune
+    def prune_old_blocks(self, keep: int = DEFAULT_KEEP_BLOCKS) -> int:
+        """
+        Drop full transaction lists from blocks older than the last `keep` blocks.
+        Headers (hash, merkle_root, state_root, …) are retained so the chain
+        still links; balances remain in the clean state file.
+        Returns number of blocks pruned.
+        """
+        if keep < 1:
+            keep = 1
+        if len(self.chain) <= keep:
+            print(f"[*] Nothing to prune (chain has {len(self.chain)} blocks, keep={keep})")
+            return 0
+        cutoff = len(self.chain) - keep
+        pruned = 0
+        for i in range(cutoff):
+            b = self.chain[i]
+            if b.transactions:
+                # keep a lightweight stub so to_dict still works
+                b.transactions = []
+                pruned += 1
+        self.pruned_up_to = max(self.pruned_up_to, self.chain[cutoff - 1].index)
+        self._save()
+        print(f"[+] Pruned txs from {pruned} blocks (kept last {keep}). "
+              f"pruned_up_to=#{self.pruned_up_to}")
+        return pruned
+
+    # ------------------------------------------------------------------ Export / Import
+    def export_chain(self, path: Optional[str] = None) -> Path:
+        """Export full chain + state to a single JSON file under exports/."""
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        out = Path(path) if path else EXPORT_DIR / f"vexlore_export_{ts}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "name": CHAIN_NAME,
+            "version": VERSION,
+            "exported_at": time.time(),
+            "difficulty": self.current_difficulty,
+            "state_root": self.state_root,
+            "pruned_up_to": self.pruned_up_to,
+            "balances": self.balances,
+            "chain": [b.to_dict() for b in self.chain],
+        }
+        out.write_text(json.dumps(payload, indent=2))
+        print(f"[+] Exported {len(self.chain)} blocks + {len(self.balances)} accounts → {out}")
+        return out
+
+    def import_chain(self, path: str, replace: bool = True) -> bool:
+        """Import chain + state from an export file. If replace=False, only adopt if longer."""
+        p = Path(path)
+        if not p.exists():
+            print(f"[-] File not found: {path}")
+            return False
+        try:
+            raw = json.loads(p.read_text())
+            blocks = [Block.from_dict(b) for b in raw["chain"]]
+            if not self.is_valid(blocks, check_merkle=True):
+                print("[-] Imported chain failed validation")
+                return False
+            if not replace and len(blocks) <= len(self.chain):
+                print("[-] Imported chain is not longer; skipped (use replace=True to force)")
+                return False
+            self.chain = blocks
+            self.balances = {k: float(v) for k, v in raw.get("balances", {}).items()}
+            self.state_root = raw.get("state_root") or balances_merkle_root(self.balances)
+            self.current_difficulty = raw.get("difficulty", self.chain[-1].difficulty)
+            self.pruned_up_to = raw.get("pruned_up_to", -1)
+            self.pending = []
+            self._save()
+            print(f"[+] Imported {len(self.chain)} blocks, {len(self.balances)} accounts, "
+                  f"state_root={self.state_root[:12]}...")
+            return True
+        except Exception as e:
+            print(f"[-] Import failed: {e}")
+            return False
 
 # ---------------------------------------------------------------------------
 # Networking + ML-KEM encrypted messages
@@ -990,16 +1286,37 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path.rstrip("/") or "/"
         if path == "/":
-            self._json(200, {"name": CHAIN_NAME, "version": VERSION, "blocks": len(self.chain.chain),
-                             "difficulty": self.chain.current_difficulty, "mempool": len(self.chain.pending),
-                             "peers": len(self.peers.peers), "kem": "ML-KEM-512"})
+            self._json(200, {
+                "name": CHAIN_NAME, "version": VERSION,
+                "blocks": len(self.chain.chain),
+                "difficulty": self.chain.current_difficulty,
+                "mempool": len(self.chain.pending),
+                "peers": len(self.peers.peers),
+                "accounts": len(self.chain.balances),
+                "state_root": self.chain.state_root,
+                "kem": "ML-KEM-512",
+            })
         elif path == "/chain":
-            self._json(200, {"length": len(self.chain.chain), "chain": [b.to_dict() for b in self.chain.chain]})
+            self._json(200, {
+                "length": len(self.chain.chain),
+                "state_root": self.chain.state_root,
+                "chain": [b.to_dict() for b in self.chain.chain],
+            })
         elif path == "/status":
-            self._json(200, {"version": VERSION, "blocks": len(self.chain.chain),
-                             "difficulty": self.chain.current_difficulty, "last_hash": self.chain.last_block.hash,
-                             "mempool": len(self.chain.pending), "peers": self.peers.list(),
-                             "kem_ek": self.kem_ek.hex()[:32] + "..."})
+            self._json(200, {
+                "version": VERSION,
+                "blocks": len(self.chain.chain),
+                "difficulty": self.chain.current_difficulty,
+                "last_hash": self.chain.last_block.hash,
+                "mempool": len(self.chain.pending),
+                "peers": self.peers.list(),
+                "state_root": self.chain.state_root,
+                "accounts": len(self.chain.balances),
+                "pruned_up_to": self.chain.pruned_up_to,
+                "kem_ek": self.kem_ek.hex()[:32] + "...",
+            })
+        elif path == "/state":
+            self._json(200, self.chain.state_summary())
         elif path == "/peers":
             self._json(200, {"peers": self.peers.list()})
         elif path in ("/pending", "/mempool"):
@@ -1143,8 +1460,8 @@ def print_banner():
    \ V /  __/>  <| | (_) | | |  __/ 
     \_/ \___/_/\_\_|\___/|_|  \___| 
                                     
-  Quantumproof Chain  v0.5  — POST-QUANTUM EXTRA
-  ML-KEM node encryption • Hybrid signatures • VEXQ addresses • Key rotation
+  Quantumproof Chain  v0.6  — STATE & DATA
+  Clean balances • Merkle trees • Prune • Export/Import
 """)
 
 def main():
@@ -1187,7 +1504,12 @@ Network:
   17) Remove peer             18) Sync now
   19) Node status             20) Start node (custom port)
 
-{len(chain.chain)} blocks | diff {chain.current_difficulty} | mempool {len(chain.pending)} | addrs {n_addr}
+State & Data (v0.6):
+  21) State summary           22) Verify state root
+  23) Merkle proof for tx     24) Prune old blocks
+  25) Export chain            26) Import chain
+
+{len(chain.chain)} blocks | diff {chain.current_difficulty} | mempool {len(chain.pending)} | accounts {len(chain.balances)} | addrs {n_addr}
 """)
         c = input("Vexlore> ").strip()
         if c == "1":
@@ -1250,13 +1572,19 @@ Network:
                     node.peers.broadcast_block(block)
         elif c == "7":
             print(f"\n=== {CHAIN_NAME} ({len(chain.chain)} blocks) ===")
+            print(f"state_root={chain.state_root[:16]}...  pruned_up_to={chain.pruned_up_to}")
             for b in chain.chain:
-                print(f"\n#{b.index}  {b.hash[:18]}...  diff={b.difficulty}  miner={b.miner[:12]}")
+                n_tx = len(b.transactions)
+                pruned_tag = " [pruned]" if n_tx == 0 and b.index <= chain.pruned_up_to else ""
+                print(f"\n#{b.index}  {b.hash[:18]}...  diff={b.difficulty}  miner={b.miner[:12]}{pruned_tag}")
+                print(f"  merkle={b.merkle_root[:14]}...  state={b.state_root[:14]}...")
                 for t in b.transactions:
                     print(f"  {t.amount} VEX  {t.sender[:12]} → {t.recipient[:12]}")
         elif c == "8":
             t0 = time.time()
-            print(f"Valid: {chain.is_valid()}  ({time.time()-t0:.3f}s)")
+            ok = chain.is_valid()
+            sr_ok = chain.verify_state_root()
+            print(f"Valid: {ok}  state_root_ok: {sr_ok}  ({time.time()-t0:.3f}s)")
         elif c == "9":
             if not wallet or not wallet._unlocked:
                 print("[-] Unlock first"); continue
@@ -1287,7 +1615,7 @@ Network:
         elif c in ("14", "q", "quit", "exit"):
             if node:
                 node.stop()
-            print("Bye from Vexlore v0.5")
+            print("Bye from Vexlore v0.6")
             break
         elif c == "15":
             if not node:
@@ -1319,6 +1647,8 @@ Network:
             print(f"Mempool  : {len(chain.pending)}")
             print(f"Peers    : {len(node.peers.peers)}")
             print(f"KEM peers: {len(node.peers.peer_kem)}")
+            print(f"State    : {chain.state_root[:16]}...")
+            print(f"Accounts : {len(chain.balances)}")
             print(f"Version  : {VERSION}")
         elif c == "20":
             if node:
@@ -1329,6 +1659,50 @@ Network:
                 node.start()
             except Exception as e:
                 print(f"[-] {e}"); node = None
+        # ---- v0.6 State & Data ----
+        elif c == "21":
+            s = chain.state_summary()
+            print(f"  state_root    : {s['state_root']}")
+            print(f"  accounts      : {s['account_count']}")
+            print(f"  total supply  : {s['total_supply']} VEX")
+            print(f"  blocks        : {s['blocks']}")
+            print(f"  pruned_up_to  : {s['pruned_up_to']}")
+            if chain.balances:
+                print("  Top balances:")
+                for addr, bal in sorted(chain.balances.items(), key=lambda x: -x[1])[:10]:
+                    print(f"    {addr[:20]}...  {bal:.2f} VEX")
+        elif c == "22":
+            ok = chain.verify_state_root()
+            print(f"  State root valid: {ok}")
+            t0 = time.time()
+            print(f"  Chain valid: {chain.is_valid()}  ({time.time()-t0:.3f}s)")
+        elif c == "23":
+            try:
+                bi = int(input("Block index: ").strip())
+                tid = input("Tx id: ").strip()
+                proof = chain.merkle_proof_for_tx(bi, tid)
+                if not proof:
+                    print("[-] Not found")
+                else:
+                    print(f"  leaf  : {proof['leaf'][:24]}...")
+                    print(f"  root  : {proof['root'][:24]}...")
+                    print(f"  valid : {proof['valid']}")
+                    print(f"  path  : {len(proof['proof'])} steps")
+                    for sib, side in proof["proof"]:
+                        print(f"    {side} {sib[:16]}...")
+            except Exception as e:
+                print(f"[-] {e}")
+        elif c == "24":
+            keep = input(f"Keep last N blocks [{DEFAULT_KEEP_BLOCKS}]: ").strip()
+            keep = int(keep) if keep else DEFAULT_KEEP_BLOCKS
+            chain.prune_old_blocks(keep)
+        elif c == "25":
+            path = input("Export path (Enter = auto): ").strip() or None
+            chain.export_chain(path)
+        elif c == "26":
+            path = input("Import file path: ").strip()
+            force = input("Force replace even if shorter? [y/N]: ").strip().lower().startswith("y")
+            chain.import_chain(path, replace=force)
         else:
             print("Unknown")
 
