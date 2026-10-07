@@ -14,18 +14,18 @@ Uses real **ML-DSA-44** (FIPS 204) + **ML-KEM-512** (FIPS 203) + hybrid Ed25519 
 | **v0.2** | NETWORK — multi-node, gossip, auto-sync |
 | **v0.3** | BETTER CHAIN — adaptive difficulty, bigger blocks, atomic saves |
 | **v0.4** | WALLET UPGRADES — seed phrase, encrypted wallets, multi-address, history |
-| **v0.5** | POST-QUANTUM EXTRA — ML-KEM node encryption, hybrid signatures, VEXQ addresses, key rotation |
+| **v0.5** | POST-QUANTUM EXTRA — ML-KEM, hybrid sigs, VEXQ, key rotation |
 | **v0.6** | STATE & DATA — clean balances, Merkle trees, prune, export/import |
+| **v0.7** | API & TOOLS — JSON-RPC, block explorer, log viewer, better CLI |
 
-## What's new in v0.6
+## What's new in v0.7
 
-- **Clean account-balance state** — balances live in `data/vexlore_state.json` (not bloated into every chain dump). Zero balances are dropped. `state_root` is a Merkle root over sorted `(address, balance)` pairs.
-- **Merkle trees**
-  - Every block has a **tx `merkle_root`** (leaves = SHA256 of each tx JSON).
-  - Block hash commits to `merkle_root` + `state_root` (instead of the full tx list).
-  - CLI option **23** builds / verifies a Merkle proof for any tx.
-- **Prune old data** — option **24** strips full transaction lists from older blocks while keeping headers + the clean state file (configurable "keep last N").
-- **Export / import** — options **25** / **26** write or load a single JSON containing chain + balances + roots (`exports/`).
+- **Simple JSON-RPC** — `POST /rpc` (and `GET /rpc?method=...`)
+  - Methods: `getinfo`, `getblockcount`, `getblock`, `getbalance`, `listbalances`,
+    `getmempool`, `gettransaction`, `getstate`, `validate`, `getpeers`, `help`
+- **Block explorer** — local web UI at `/explorer` (dark theme, recent blocks, balances, mempool)
+- **Log viewer** — ring buffer + `data/vexlore.log`; CLI option **27** and `GET /logs`
+- **Improved CLI** — aliases (`mine`, `bal`, `logs`, `explorer`, …) + grouped menu
 
 ## Quick Start
 
@@ -34,20 +34,42 @@ pip install requests cryptography
 python3 vexlore_chain.py
 ```
 
-You need both folders next to the script:
-- `dilithium_src/`  (ML-DSA)
-- `kyber_src/`      (ML-KEM)
+Open the explorer in a browser:
 
-### First run
+```
+http://127.0.0.1:5000/explorer
+```
 
-1. Option **1** → create wallet → write down the 12 words  
-2. Option **4** → faucet  
-3. Option **6** → mine  
-4. Option **3** → see balance  
-5. Option **21** → state summary (accounts, supply, state_root)  
-6. Option **23** → Merkle proof for a tx  
-7. Option **24** → prune old blocks  
-8. Option **25** → export chain  
+### RPC examples
+
+```bash
+# info
+curl -s -X POST http://127.0.0.1:5000/rpc \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"getinfo","id":1}'
+
+# balance
+curl -s 'http://127.0.0.1:5000/rpc?method=getbalance&address=VEXQ...'
+
+# block by height
+curl -s 'http://127.0.0.1:5000/block/0'
+
+# logs
+curl -s 'http://127.0.0.1:5000/logs?n=20'
+```
+
+### CLI aliases
+
+| Alias | Action |
+|-------|--------|
+| `mine` / `m` | Mine block |
+| `bal` / `balance` | Show balance |
+| `send` / `tx` | Send transaction |
+| `logs` | View recent logs |
+| `explorer` / `ui` | Open block explorer |
+| `rpc` | Print RPC help |
+| `state` | State summary |
+| `help` / `?` | Help |
 
 ## Folder layout
 
@@ -55,30 +77,15 @@ You need both folders next to the script:
 vexlore/
 ├── vexlore_chain.py
 ├── README.md
-├── dilithium_src/     ← ML-DSA-44
-├── kyber_src/         ← ML-KEM-512
-├── wallet/            ← encrypted wallets
-├── data/              ← chain + clean state + peers
+├── dilithium_src/
+├── kyber_src/
+├── wallet/
+├── data/
 │   ├── vexlore_chain.json
-│   ├── vexlore_state.json   ← NEW (v0.6)
-│   └── peers.json
-└── exports/           ← export/import snapshots
+│   ├── vexlore_state.json
+│   ├── peers.json
+│   └── vexlore.log          ← NEW (v0.7)
+└── exports/
 ```
-
-## HTTP endpoints (node)
-
-| Path | Description |
-|------|-------------|
-| `GET /` | Node info + state_root |
-| `GET /chain` | Full chain |
-| `GET /status` | Status + accounts + pruned_up_to |
-| `GET /state` | Clean state summary |
-| `GET /pending` | Mempool |
-| `GET /peers` | Peer list |
-| `GET /kem` | ML-KEM encapsulation key |
-| `POST /block` | Accept block (optional ML-KEM encryption) |
-| `POST /transaction` | Accept tx |
-| `POST /peers` | Register peer |
-| `POST /kem` | Exchange KEM keys |
 
 Educational only — do not put real money on it.

@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Vexlore Quantumproof Chain  v0.6 — STATE & DATA
+Vexlore Quantumproof Chain  v0.7 — API & TOOLS
 Educational post-quantum blockchain.
 
-v0.6 adds:
-  • Clean account-balance state (separate state root + file)
-  • Merkle trees for transactions (per-block) and balances (state root)
-  • Prune old blocks option (keep recent N + state)
-  • Export / import chain + state
+v0.7 adds:
+  • Simple JSON-RPC commands (/rpc)
+  • Local block explorer (web UI at /explorer)
+  • Improved CLI (aliases + grouped commands)
+  • Log viewer (ring buffer + /logs + CLI)
 
-Also includes all v0.5 post-quantum extras (ML-KEM, hybrid sigs,
-VEXQ addresses, key rotation) and earlier wallet/chain features.
+Also includes all v0.6 state/data features and earlier PQ extras.
 
 Not production-ready — for learning only.
 """
@@ -31,7 +30,9 @@ from dataclasses import dataclass, asdict, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
+from collections import deque
+from datetime import datetime
 
 try:
     import requests
@@ -68,7 +69,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 CHAIN_NAME = "Vexlore Quantumproof Chain"
-VERSION = "0.6.0-state-data"
+VERSION = "0.7.0-api-tools"
 
 INITIAL_DIFFICULTY = 3
 TARGET_BLOCK_TIME = 20
@@ -90,6 +91,8 @@ STATE_FILE = DATA_DIR / "vexlore_state.json"
 PEERS_FILE = DATA_DIR / "peers.json"
 WALLETS_DIR = Path(__file__).parent / "wallet"
 EXPORT_DIR = Path(__file__).parent / "exports"
+LOG_FILE = DATA_DIR / "vexlore.log"
+LOG_MAX_LINES = 500
 DATA_DIR.mkdir(exist_ok=True)
 WALLETS_DIR.mkdir(exist_ok=True)
 EXPORT_DIR.mkdir(exist_ok=True)
@@ -230,6 +233,50 @@ def balances_merkle_root(balances: Dict[str, float]) -> str:
     items = sorted(balances.items())
     leaves = [merkle_leaf(f"{addr}:{bal:.8f}".encode()) for addr, bal in items]
     return build_merkle_root(leaves)
+
+
+# ---------------------------------------------------------------------------
+# Logger (v0.7) — ring buffer + optional file
+# ---------------------------------------------------------------------------
+class VexLog:
+    """In-memory ring buffer of log lines + append to data/vexlore.log."""
+
+    LEVELS = ("DEBUG", "INFO", "WARN", "ERROR")
+
+    def __init__(self, maxlen: int = LOG_MAX_LINES, path: Path = LOG_FILE):
+        self._buf: deque = deque(maxlen=maxlen)
+        self.path = path
+        self._lock = threading.Lock()
+
+    def _write(self, level: str, msg: str):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] [{level}] {msg}"
+        with self._lock:
+            self._buf.append(line)
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
+        # also mirror important lines to stdout lightly
+        if level in ("WARN", "ERROR"):
+            print(line)
+
+    def debug(self, msg: str): self._write("DEBUG", msg)
+    def info(self, msg: str):  self._write("INFO", msg)
+    def warn(self, msg: str):  self._write("WARN", msg)
+    def error(self, msg: str): self._write("ERROR", msg)
+
+    def tail(self, n: int = 50) -> List[str]:
+        with self._lock:
+            items = list(self._buf)
+        return items[-n:] if n > 0 else items
+
+    def clear(self):
+        with self._lock:
+            self._buf.clear()
+
+LOG = VexLog()
 
 # ---------------------------------------------------------------------------
 # Mnemonic (fallback if no bip39 file – generate simple 12-word from entropy)
@@ -913,6 +960,7 @@ class VexloreChain:
         block.mine()
         print(f"[+] Mined in {time.time()-t0:.2f}s  {block.hash[:20]}...  "
               f"merkle={block.merkle_root[:12]}... state={block.state_root[:12]}...")
+        LOG.info(f"Mined block #{block.index} hash={block.hash[:16]}... txs={len(txs)} diff={block.difficulty}")
         self.state_root = new_state_root
         self.chain.append(block)
         self.pending = remaining
@@ -967,6 +1015,7 @@ class VexloreChain:
         )
         self.pending.append(tx)
         print(f"[+] Faucet {amount} VEX → {address[:16]}... (mempool {len(self.pending)})")
+        LOG.info(f"Faucet {amount} VEX → {address[:16]}...")
 
     def replace_chain(self, new_blocks: List[Block]) -> bool:
         if len(new_blocks) <= len(self.chain) or not self.is_valid(new_blocks):
@@ -1071,6 +1120,7 @@ class VexloreChain:
         self._save()
         print(f"[+] Pruned txs from {pruned} blocks (kept last {keep}). "
               f"pruned_up_to=#{self.pruned_up_to}")
+        LOG.info(f"Pruned {pruned} blocks, keep={keep}, pruned_up_to=#{self.pruned_up_to}")
         return pruned
 
     # ------------------------------------------------------------------ Export / Import
@@ -1249,7 +1299,8 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
     kem_dk: bytes
 
     def log_message(self, fmt, *args):
-        print(f"  [HTTP] {self.address_string()} {fmt % args}")
+        msg = f"{self.address_string()} {fmt % args}"
+        LOG.debug(f"HTTP {msg}")
 
     def _json(self, code: int, obj):
         body = json.dumps(obj).encode()
@@ -1257,6 +1308,22 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html(self, code: int, html: str):
+        body = html.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _text(self, code: int, text: str):
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -1270,7 +1337,6 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
             return None
 
     def _maybe_decrypt(self, data: dict) -> Optional[dict]:
-        """If payload is ML-KEM encrypted, decapsulate and decrypt."""
         if not data or data.get("vexlore_enc") != "mlkem512-fernet":
             return data
         try:
@@ -1280,11 +1346,229 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
             plain = f.decrypt(base64.b64decode(data["ciphertext"]))
             return json.loads(plain.decode())
         except Exception as e:
-            print(f"  [!] KEM decrypt failed: {e}")
+            LOG.error(f"KEM decrypt failed: {e}")
             return None
 
+    # ------------------------------------------------------------------ RPC
+    def _rpc_dispatch(self, method: str, params: Any) -> Any:
+        """Simple JSON-RPC style methods (no auth — educational only)."""
+        c = self.chain
+        method = (method or "").strip().lower()
+        params = params or {}
+        if isinstance(params, list):
+            # positional → dict for common cases
+            if method in ("getblock", "getblockhash") and params:
+                params = {"height": params[0]}
+            elif method == "getbalance" and params:
+                params = {"address": params[0]}
+            elif method in ("gettransaction", "gettx") and params:
+                params = {"txid": params[0]}
+            else:
+                params = {}
+
+        if method in ("getinfo", "info"):
+            return {
+                "name": CHAIN_NAME, "version": VERSION,
+                "blocks": len(c.chain), "difficulty": c.current_difficulty,
+                "mempool": len(c.pending), "peers": len(self.peers.peers),
+                "accounts": len(c.balances), "state_root": c.state_root,
+                "pruned_up_to": c.pruned_up_to, "algo": "hybrid-Ed25519+ML-DSA-44 + ML-KEM-512",
+            }
+        if method in ("getblockcount", "blockcount"):
+            return len(c.chain)
+        if method in ("getdifficulty", "difficulty"):
+            return c.current_difficulty
+        if method in ("getbestblockhash", "bestblockhash"):
+            return c.last_block.hash if c.chain else None
+        if method in ("getblockhash",):
+            h = int(params.get("height", -1))
+            if 0 <= h < len(c.chain):
+                return c.chain[h].hash
+            raise ValueError("height out of range")
+        if method in ("getblock", "block"):
+            if "hash" in params and params["hash"]:
+                for b in c.chain:
+                    if b.hash == params["hash"]:
+                        return b.to_dict()
+                raise ValueError("block not found")
+            h = int(params.get("height", params.get("index", -1)))
+            if 0 <= h < len(c.chain):
+                return c.chain[h].to_dict()
+            raise ValueError("height out of range")
+        if method in ("getbalance", "balance"):
+            addr = params.get("address", "")
+            if not addr:
+                raise ValueError("address required")
+            return c.get_balance(addr)
+        if method in ("listbalances", "accounts"):
+            return dict(sorted(c.balances.items(), key=lambda x: -x[1]))
+        if method in ("getmempool", "mempool", "pending"):
+            return {"count": len(c.pending), "pending": [t.to_dict() for t in c.pending]}
+        if method in ("gettransaction", "gettx", "tx"):
+            txid = params.get("txid", params.get("tx_id", ""))
+            if not txid:
+                raise ValueError("txid required")
+            for b in c.chain:
+                for t in b.transactions:
+                    if t.tx_id == txid:
+                        return {**t.to_dict(), "block": b.index, "block_hash": b.hash}
+            for t in c.pending:
+                if t.tx_id == txid:
+                    return {**t.to_dict(), "block": None, "confirmations": 0}
+            raise ValueError("tx not found")
+        if method in ("getstate", "state"):
+            return c.state_summary()
+        if method in ("validate", "isvalid"):
+            return {"valid": c.is_valid(), "state_root_ok": c.verify_state_root()}
+        if method in ("getpeers", "peers"):
+            return self.peers.list()
+        if method in ("help", "listmethods"):
+            return [
+                "getinfo", "getblockcount", "getdifficulty", "getbestblockhash",
+                "getblockhash", "getblock", "getbalance", "listbalances",
+                "getmempool", "gettransaction", "getstate", "validate", "getpeers", "help",
+            ]
+        raise ValueError(f"unknown method: {method}")
+
+    def _handle_rpc(self, data: Optional[dict]):
+        # Support both JSON-RPC 2.0 and simple {method, params}
+        if not data:
+            self._json(400, {"error": "empty body"})
+            return
+        # batch?
+        if isinstance(data, list):
+            out = []
+            for item in data:
+                out.append(self._rpc_one(item))
+            self._json(200, out)
+            return
+        self._json(200, self._rpc_one(data))
+
+    def _rpc_one(self, data: dict) -> dict:
+        req_id = data.get("id")
+        method = data.get("method", "")
+        params = data.get("params", {})
+        try:
+            result = self._rpc_dispatch(method, params)
+            resp = {"result": result, "error": None}
+            if req_id is not None:
+                resp["id"] = req_id
+            if "jsonrpc" in data:
+                resp["jsonrpc"] = "2.0"
+            return resp
+        except Exception as e:
+            resp = {"result": None, "error": {"message": str(e)}}
+            if req_id is not None:
+                resp["id"] = req_id
+            if "jsonrpc" in data:
+                resp["jsonrpc"] = "2.0"
+            return resp
+
+    # ------------------------------------------------------------------ Explorer HTML
+    def _explorer_page(self) -> str:
+        c = self.chain
+        blocks_html = []
+        for b in reversed(c.chain[-30:]):
+            n_tx = len(b.transactions)
+            ts = datetime.fromtimestamp(b.timestamp).strftime("%Y-%m-%d %H:%M:%S") if b.timestamp else "?"
+            blocks_html.append(
+                f'<tr><td>{b.index}</td><td class="mono" title="{b.hash}">{b.hash[:16]}…</td>'
+                f'<td>{n_tx}</td><td>{b.difficulty}</td><td class="mono">{b.miner[:14]}…</td>'
+                f'<td>{ts}</td></tr>'
+            )
+        bals = sorted(c.balances.items(), key=lambda x: -x[1])[:20]
+        bals_html = "".join(
+            f'<tr><td class="mono">{a}</td><td class="num">{bal:.4f}</td></tr>' for a, bal in bals
+        ) or '<tr><td colspan="2">no accounts yet</td></tr>'
+        mem_html = "".join(
+            f'<tr><td class="mono">{t.tx_id[:12]}…</td><td class="num">{t.amount:.2f}</td>'
+            f'<td class="mono">{t.sender[:12]}…</td><td class="mono">{t.recipient[:12]}…</td></tr>'
+            for t in c.pending[:20]
+        ) or '<tr><td colspan="4">mempool empty</td></tr>'
+        return f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vexlore Explorer — {VERSION}</title>
+<style>
+  :root {{ --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#e6edf3; --muted:#8b949e;
+           --accent:#58a6ff; --green:#3fb950; --purple:#a371f7; }}
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+         background:var(--bg); color:var(--text); line-height:1.5; }}
+  header {{ padding:1.25rem 1.5rem; border-bottom:1px solid var(--border);
+           display:flex; flex-wrap:wrap; gap:1rem; align-items:center; justify-content:space-between; }}
+  h1 {{ margin:0; font-size:1.25rem; letter-spacing:.02em; }}
+  h1 span {{ color:var(--purple); }}
+  .badge {{ font-size:.75rem; background:var(--card); border:1px solid var(--border);
+           padding:.2rem .55rem; border-radius:999px; color:var(--muted); }}
+  main {{ max-width:1100px; margin:0 auto; padding:1.25rem; }}
+  .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:.75rem; margin-bottom:1.5rem; }}
+  .stat {{ background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1rem; }}
+  .stat .lbl {{ color:var(--muted); font-size:.75rem; text-transform:uppercase; letter-spacing:.06em; }}
+  .stat .val {{ font-size:1.35rem; font-weight:600; margin-top:.25rem; color:var(--accent); }}
+  section {{ background:var(--card); border:1px solid var(--border); border-radius:10px;
+            padding:1rem 1.1rem; margin-bottom:1.25rem; }}
+  section h2 {{ margin:0 0 .75rem; font-size:1rem; color:var(--muted); font-weight:600; }}
+  table {{ width:100%; border-collapse:collapse; font-size:.875rem; }}
+  th, td {{ text-align:left; padding:.45rem .4rem; border-bottom:1px solid var(--border); }}
+  th {{ color:var(--muted); font-weight:500; font-size:.75rem; text-transform:uppercase; }}
+  .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.8rem; }}
+  .num {{ font-variant-numeric: tabular-nums; color:var(--green); }}
+  footer {{ text-align:center; color:var(--muted); font-size:.75rem; padding:1.5rem; }}
+  a {{ color:var(--accent); }}
+</style></head><body>
+<header>
+  <h1>Vexlore <span>Explorer</span></h1>
+  <div>
+    <span class="badge">{VERSION}</span>
+    <span class="badge">ML-KEM-512 · Hybrid sigs</span>
+  </div>
+</header>
+<main>
+  <div class="grid">
+    <div class="stat"><div class="lbl">Blocks</div><div class="val">{len(c.chain)}</div></div>
+    <div class="stat"><div class="lbl">Difficulty</div><div class="val">{c.current_difficulty}</div></div>
+    <div class="stat"><div class="lbl">Mempool</div><div class="val">{len(c.pending)}</div></div>
+    <div class="stat"><div class="lbl">Accounts</div><div class="val">{len(c.balances)}</div></div>
+    <div class="stat"><div class="lbl">Peers</div><div class="val">{len(self.peers.peers)}</div></div>
+    <div class="stat"><div class="lbl">Supply</div><div class="val">{sum(c.balances.values()):.0f}</div></div>
+  </div>
+  <section>
+    <h2>State root</h2>
+    <div class="mono" style="word-break:break-all">{c.state_root}</div>
+  </section>
+  <section>
+    <h2>Recent blocks (last 30)</h2>
+    <table>
+      <thead><tr><th>#</th><th>Hash</th><th>Txs</th><th>Diff</th><th>Miner</th><th>Time</th></tr></thead>
+      <tbody>{''.join(blocks_html) or '<tr><td colspan="6">no blocks</td></tr>'}</tbody>
+    </table>
+  </section>
+  <section>
+    <h2>Top balances</h2>
+    <table>
+      <thead><tr><th>Address</th><th>Balance (VEX)</th></tr></thead>
+      <tbody>{bals_html}</tbody>
+    </table>
+  </section>
+  <section>
+    <h2>Mempool</h2>
+    <table>
+      <thead><tr><th>Tx</th><th>Amount</th><th>From</th><th>To</th></tr></thead>
+      <tbody>{mem_html}</tbody>
+    </table>
+  </section>
+</main>
+<footer>
+  Educational only · <a href="/">API</a> · <a href="/rpc">RPC</a> · <a href="/logs">Logs</a> · <a href="/status">Status</a>
+</footer>
+</body></html>"""
+
     def do_GET(self):
-        path = urlparse(self.path).path.rstrip("/") or "/"
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        qs = parse_qs(parsed.query)
+
         if path == "/":
             self._json(200, {
                 "name": CHAIN_NAME, "version": VERSION,
@@ -1295,7 +1579,39 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
                 "accounts": len(self.chain.balances),
                 "state_root": self.chain.state_root,
                 "kem": "ML-KEM-512",
+                "endpoints": {
+                    "explorer": "/explorer",
+                    "rpc": "POST /rpc",
+                    "logs": "/logs",
+                    "status": "/status",
+                    "state": "/state",
+                    "chain": "/chain",
+                    "mempool": "/mempool",
+                },
             })
+        elif path in ("/explorer", "/ui", "/browse"):
+            self._html(200, self._explorer_page())
+        elif path == "/logs":
+            n = 50
+            if "n" in qs:
+                try:
+                    n = max(1, min(500, int(qs["n"][0])))
+                except Exception:
+                    pass
+            lines = LOG.tail(n)
+            if "format" in qs and qs["format"][0] == "json":
+                self._json(200, {"count": len(lines), "lines": lines})
+            else:
+                self._text(200, "\n".join(lines) + ("\n" if lines else "(no logs yet)\n"))
+        elif path == "/rpc":
+            # GET /rpc?method=getinfo  or  ?method=getbalance&address=...
+            method = (qs.get("method") or ["help"])[0]
+            params = {k: v[0] for k, v in qs.items() if k != "method"}
+            try:
+                result = self._rpc_dispatch(method, params)
+                self._json(200, {"result": result, "error": None})
+            except Exception as e:
+                self._json(400, {"result": None, "error": {"message": str(e)}})
         elif path == "/chain":
             self._json(200, {
                 "length": len(self.chain.chain),
@@ -1323,12 +1639,34 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
             self._json(200, {"count": len(self.chain.pending), "pending": [t.to_dict() for t in self.chain.pending]})
         elif path == "/kem":
             self._json(200, {"ek": self.kem_ek.hex(), "algo": "ML-KEM-512"})
+        elif path.startswith("/block/"):
+            key = path.split("/block/", 1)[1]
+            try:
+                if key.isdigit():
+                    result = self._rpc_dispatch("getblock", {"height": int(key)})
+                else:
+                    result = self._rpc_dispatch("getblock", {"hash": key})
+                self._json(200, result)
+            except Exception as e:
+                self._json(404, {"error": str(e)})
+        elif path.startswith("/tx/"):
+            txid = path.split("/tx/", 1)[1]
+            try:
+                self._json(200, self._rpc_dispatch("gettransaction", {"txid": txid}))
+            except Exception as e:
+                self._json(404, {"error": str(e)})
+        elif path.startswith("/balance/"):
+            addr = path.split("/balance/", 1)[1]
+            self._json(200, {"address": addr, "balance": self.chain.get_balance(addr)})
         else:
-            self._json(404, {"error": "not found"})
+            self._json(404, {"error": "not found", "hint": "try /explorer /rpc /logs /status"})
 
     def do_POST(self):
         path = urlparse(self.path).path.rstrip("/") or "/"
         data = self._read()
+        if path in ("/rpc", "/jsonrpc"):
+            self._handle_rpc(data)
+            return
         if path == "/block":
             data = self._maybe_decrypt(data or {})
             if not data:
@@ -1342,6 +1680,7 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
             ok = self.chain.add_block_from_peer(block)
             if ok:
                 self.peers.broadcast_block(block)
+                LOG.info(f"Accepted block #{block.index} from peer")
             self._json(200 if ok else 409, {"status": "accepted" if ok else "rejected"})
         elif path == "/transaction":
             data = self._maybe_decrypt(data or {})
@@ -1354,16 +1693,18 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "invalid tx"})
                 return
             ok = self.chain.add_transaction(tx)
+            if ok:
+                LOG.info(f"Mempool +tx {tx.tx_id[:8]}... {tx.amount} VEX")
             self._json(200 if ok else 409, {"status": "ok" if ok else "rejected"})
         elif path == "/peers":
             url = (data or {}).get("url", "")
             if url:
                 self.peers.add(url)
+                LOG.info(f"Peer added via HTTP: {url}")
                 self._json(200, {"status": "added", "peers": self.peers.list()})
             else:
                 self._json(400, {"error": "url required"})
         elif path == "/kem":
-            # peer is sending us their ek; reply with ours
             their_ek_hex = (data or {}).get("ek", "")
             their_url = (data or {}).get("url", "")
             if their_ek_hex and their_url:
@@ -1373,6 +1714,7 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
             self._json(200, {"ek": self.kem_ek.hex(), "algo": "ML-KEM-512"})
         else:
             self._json(404, {"error": "not found"})
+
 
 class NodeServer:
     def __init__(self, chain: VexloreChain, port: int = DEFAULT_PORT, host: str = "0.0.0.0"):
@@ -1406,8 +1748,12 @@ class NodeServer:
         self._server = HTTPServer((self.host, self.port), handler)
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
         print(f"[+] Node on http://{self.host}:{self.port}")
-        print(f"    Self URL : {self.self_url}")
-        print(f"    KEM      : ML-KEM-512 (ek {len(self.kem_ek)} bytes)")
+        print(f"    Self URL  : {self.self_url}")
+        print(f"    Explorer  : {self.self_url}/explorer")
+        print(f"    RPC       : POST {self.self_url}/rpc")
+        print(f"    Logs      : {self.self_url}/logs")
+        print(f"    KEM       : ML-KEM-512 (ek {len(self.kem_ek)} bytes)")
+        LOG.info(f"Node started on {self.self_url} (v{VERSION})")
         threading.Thread(target=self._sync_loop, daemon=True).start()
 
     def stop(self):
@@ -1460,8 +1806,8 @@ def print_banner():
    \ V /  __/>  <| | (_) | | |  __/ 
     \_/ \___/_/\_\_|\___/|_|  \___| 
                                     
-  Quantumproof Chain  v0.6  — STATE & DATA
-  Clean balances • Merkle trees • Prune • Export/Import
+  Quantumproof Chain  v0.7  — API & TOOLS
+  JSON-RPC • Block explorer • Log viewer • Better CLI
 """)
 
 def main():
@@ -1487,31 +1833,59 @@ def main():
         print(f"[!] Port {DEFAULT_PORT} busy: {e}")
         node = None
 
+    # command aliases (v0.7 improved CLI)
+    ALIASES = {
+        "w": "1", "wallet": "1", "new": "1",
+        "unlock": "2", "u": "2",
+        "bal": "3", "balance": "3", "b": "3",
+        "faucet": "4", "f": "4",
+        "send": "5", "tx": "5", "transfer": "5",
+        "mine": "6", "m": "6",
+        "chain": "7", "blocks": "7",
+        "valid": "8", "validate": "8",
+        "addrs": "9", "addresses": "9",
+        "newaddr": "10",
+        "hist": "11", "history": "11",
+        "rotate": "12",
+        "lock": "13",
+        "quit": "14", "exit": "14", "q": "14",
+        "peers": "15",
+        "addpeer": "16",
+        "rmpeer": "17",
+        "sync": "18",
+        "status": "19", "stat": "19",
+        "node": "20",
+        "state": "21",
+        "stateroot": "22",
+        "merkle": "23", "proof": "23",
+        "prune": "24",
+        "export": "25",
+        "import": "26",
+        "logs": "27", "log": "27",
+        "explorer": "28", "ui": "28",
+        "rpc": "29", "help": "30", "?": "30",
+    }
+
     while True:
         n_addr = len(wallet.list_addresses()) if wallet and wallet._unlocked else 0
         print(f"""
-Commands:
-  1) New / Restore wallet     2) Unlock wallet
-  3) Show balance             4) Faucet
-  5) Send transaction         6) Mine block
-  7) Show chain               8) Validate chain
-  9) List addresses           10) New address
-  11) History                 12) Rotate key
-  13) Lock wallet             14) Quit
-
-Network:
-  15) List peers              16) Add peer
-  17) Remove peer             18) Sync now
-  19) Node status             20) Start node (custom port)
-
-State & Data (v0.6):
-  21) State summary           22) Verify state root
-  23) Merkle proof for tx     24) Prune old blocks
-  25) Export chain            26) Import chain
-
+┌─ Wallet ──────────────────────┬─ Chain ─────────────────────┐
+│ 1  wallet   2  unlock         │ 3  balance   4  faucet      │
+│ 5  send     6  mine           │ 7  chain     8  validate    │
+│ 9  addrs   10  newaddr        │11  history  12  rotate      │
+│13  lock    14  quit           │                             │
+├─ Network ─────────────────────┼─ State & Data ──────────────┤
+│15  peers   16  addpeer        │21  state    22  stateroot   │
+│17  rmpeer  18  sync           │23  merkle   24  prune       │
+│19  status  20  node           │25  export   26  import      │
+├─ API & Tools (v0.7) ──────────┴─────────────────────────────┤
+│27  logs     28  explorer     29  rpc help    30  help       │
+└─────────────────────────────────────────────────────────────┘
+  Tip: type numbers OR aliases  (mine, bal, logs, explorer, …)
 {len(chain.chain)} blocks | diff {chain.current_difficulty} | mempool {len(chain.pending)} | accounts {len(chain.balances)} | addrs {n_addr}
 """)
-        c = input("Vexlore> ").strip()
+        raw = input("Vexlore> ").strip()
+        c = ALIASES.get(raw.lower(), raw)
         if c == "1":
             name = input("Name [alice]: ").strip() or "alice"
             mode = input("(n)ew / (r)estore [n]: ").strip().lower() or "n"
@@ -1615,7 +1989,7 @@ State & Data (v0.6):
         elif c in ("14", "q", "quit", "exit"):
             if node:
                 node.stop()
-            print("Bye from Vexlore v0.6")
+            print("Bye from Vexlore v0.7")
             break
         elif c == "15":
             if not node:
@@ -1703,8 +2077,63 @@ State & Data (v0.6):
             path = input("Import file path: ").strip()
             force = input("Force replace even if shorter? [y/N]: ").strip().lower().startswith("y")
             chain.import_chain(path, replace=force)
+        elif c == "27":
+            n = input("Lines [50]: ").strip()
+            n = int(n) if n.isdigit() else 50
+            lines = LOG.tail(n)
+            if not lines:
+                print("  (no logs yet)")
+            else:
+                print(f"  --- last {len(lines)} log lines ---")
+                for line in lines:
+                    print(f"  {line}")
+            if node:
+                print(f"  Also: {node.self_url}/logs")
+        elif c == "28":
+            if not node:
+                print("[-] Start node first (option 20 or auto-start)")
+            else:
+                url = f"{node.self_url}/explorer"
+                print(f"[+] Block explorer: {url}")
+                print("    Open that URL in your browser.")
+                try:
+                    import webbrowser
+                    webbrowser.open(url)
+                except Exception:
+                    pass
+        elif c == "29":
+            if not node:
+                print("[-] Node not running")
+            else:
+                base = node.self_url
+                print(f"""
+  JSON-RPC  POST {base}/rpc
+  Body example:
+    {{"method":"getinfo","params":{{}},"id":1}}
+    {{"method":"getbalance","params":{{"address":"VEXQ..."}},"id":2}}
+    {{"method":"getblock","params":{{"height":0}},"id":3}}
+
+  Or GET shortcuts:
+    {base}/rpc?method=getinfo
+    {base}/rpc?method=getblock&height=0
+    {base}/balance/<address>
+    {base}/block/<height|hash>
+    {base}/tx/<txid>
+
+  Methods: getinfo getblockcount getblock getbalance listbalances
+           getmempool gettransaction getstate validate getpeers help
+""")
+        elif c == "30":
+            print("""
+  Aliases: mine bal send faucet chain logs explorer status peers sync
+           wallet unlock state prune export import merkle rpc help quit
+
+  Explorer UI  →  option 28  or  http://<node>/explorer
+  RPC          →  option 29  or  POST /rpc
+  Logs         →  option 27  or  GET  /logs
+""")
         else:
-            print("Unknown")
+            print("Unknown — type 30 or help")
 
 if __name__ == "__main__":
     main()
