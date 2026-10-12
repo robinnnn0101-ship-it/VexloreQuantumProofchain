@@ -57,7 +57,7 @@ You need both folders next to the script:
 http://127.0.0.1:5000/explorer
 ```
 
-Opens a dark-themed local block explorer (blocks, balances, contracts) with a link to **VexloreBot**: https://t.me/VexloreBOT
+Opens a dark-themed local block Vexlore explorer (blocks, balances, contracts) with a link to **VexloreBot**: https://t.me/VexloreBOT
 
 ## Menu map
 
