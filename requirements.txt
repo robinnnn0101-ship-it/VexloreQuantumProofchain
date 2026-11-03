@@ -1,0 +1,5 @@
+requests>=2.31.0
+cryptography>=41.0.0
+dilithium-py>=1.0.0
+# Optional for full post-quantum
+# kyber-py or local kyber_src/
