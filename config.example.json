@@ -1,0 +1,8 @@
+{
+  "port": 5000,
+  "difficulty": 4,
+  "block_reward": 10,
+  "peers": [],
+  "enable_explorer": true,
+  "data_dir": "./data"
+}
