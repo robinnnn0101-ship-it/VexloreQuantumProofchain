@@ -1,10 +1,22 @@
 # Post-Quantum Features
 
-Vexlore uses:
-- **ML-DSA-44** (FIPS 204 / Dilithium) for signatures
-- **ML-KEM-512** (FIPS 203 / Kyber) for key encapsulation
-- Hybrid with Ed25519 for transition
+Vexlore uses hybrid cryptography for educational quantum resistance:
 
-These provide resistance against quantum computers running Shor's algorithm.
+## Algorithms
 
-Educational implementation only.
+- **ML-DSA-44** (FIPS 204 / Dilithium) — digital signatures
+- **ML-KEM-512** (FIPS 203 / Kyber) — key encapsulation mechanism
+- **Ed25519** — classical signatures (hybrid mode)
+
+## Why hybrid?
+
+During the transition period, hybrid schemes provide security even if one primitive is broken.
+
+## Quantum threat
+
+Shor's algorithm breaks ECDSA / Ed25519 / RSA.  
+Grover weakens symmetric crypto (use longer keys).
+
+This chain demonstrates practical PQ integration in a simple blockchain.
+
+Educational only.
