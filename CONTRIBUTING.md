@@ -1,17 +1,28 @@
 # Contributing to Vexlore Quantumproof Chain
 
-This is an educational post-quantum blockchain prototype.
-
-## Guidelines
-- Keep it educational and non-production
-- Focus on post-quantum crypto (ML-DSA, ML-KEM)
-- Improve docs, tests, or clarity
-- No real value transfers
+Thanks for interest in this educational post-quantum blockchain!
 
 ## How to contribute
-1. Fork
-2. Create feature branch
-3. Add tests if possible
-4. Open PR
 
-Made for learning by the Vexlore community.
+1. Fork the repo
+2. Create a feature branch
+3. Make your changes
+4. Add tests if applicable
+5. Update docs
+6. Open a PR
+
+## Code style
+
+- Follow PEP 8
+- Use black for formatting
+- Keep educational comments clear
+
+## Areas to improve
+
+- More post-quantum algorithms
+- Better explorer UI
+- Additional contract types
+- Performance optimizations
+- Security audits (educational)
+
+See docs/ for more.
