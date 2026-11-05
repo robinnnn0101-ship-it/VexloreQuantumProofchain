@@ -47,3 +47,15 @@ Made by robin with love ❤️
 ## Contributing
 
 PRs welcome. See CONTRIBUTING.md.
+
+## Recent Upgrades (v1.1)
+
+- Docker support
+- GitHub Actions CI
+- Modern packaging with pyproject.toml
+- Expanded documentation suite
+- Utility scripts
+- Additional tests
+- Version bump to 1.1.0
+
+Over 70+ contributions in the upgrade series.
