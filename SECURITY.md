@@ -1,9 +1,17 @@
 # Security Policy
 
-## Educational Prototype
-This is NOT for real funds. Do not use with real value.
+This is an **educational** prototype only.
 
 ## Reporting
-If you find a learning opportunity or bug in the PQ implementation, open an issue.
 
-Post-quantum signatures (ML-DSA-44) are the focus for resistance to quantum attacks.
+Do not report production vulnerabilities — none are in scope.
+For educational feedback, open an issue.
+
+## Known limitations
+
+- Not production-ready
+- Demo keys and chain state
+- Local networking only by default
+- PoW is lightweight for learning
+
+No real funds should ever be used.
