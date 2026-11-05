@@ -1,5 +1,7 @@
 requests>=2.31.0
 cryptography>=41.0.0
 dilithium-py>=1.0.0
-# Optional for full post-quantum
+# Optional for full post-quantum ML-KEM
 # kyber-py or local kyber_src/
+pytest>=7.0
+black>=23.0
