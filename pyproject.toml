@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vexlore-quantumproof-chain"
+version = "1.1.0"
+description = "Educational post-quantum blockchain with ML-DSA-44 and ML-KEM-512"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.31.0",
+    "cryptography>=41.0.0",
+    "dilithium-py>=1.0.0",
+]
+authors = [{name = "Robin", email = "robin@vexlore.xyz"}]
+license = {text = "MIT"}
+
+[project.urls]
+Homepage = "https://github.com/robinnnn0101-ship-it/VexloreQuantumProofchain"
