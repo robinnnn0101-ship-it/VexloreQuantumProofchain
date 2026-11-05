@@ -1,5 +1,13 @@
 # Changelog
 
+## [v1.1] - 2026-11-05
+- Added Dockerfile for containerized runs
+- Added GitHub Actions CI
+- Added pyproject.toml packaging
+- Improved README with features and Docker instructions
+- Enhanced docs and contribution polish
+- Multiple small upgrades and documentation expansions
+
 ## [v1.0] - 2026-11-03
 - Polished documentation
 - Added .gitignore and requirements
