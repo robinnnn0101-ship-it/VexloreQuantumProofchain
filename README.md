@@ -10,7 +10,7 @@ Uses real **ML-DSA-44** (FIPS 204) + **ML-KEM-512** (FIPS 203) + hybrid Ed25519 
 
 | Version  | Focus                                                                    |
 | -------- | ------------------------------------------------------------------------ |
-| **v1.2** | More docs, utilities, packaging polish, contribution series              |
+| **v1.2** | More docs, utilities, packaging polish, contribution series (40+)       |
 | **v1.1** | Packaging, CI, Docker, more docs & polish                                |
 | **v1.0** | Docs, setup, tests, contribution polish                                  |
 | **v0.9** | CONTRACTS + EXPLORER — multi-sig, time-locks, send rules, Vexlore UI     |
@@ -52,9 +52,9 @@ PRs welcome. See CONTRIBUTING.md.
 ## Recent Upgrades (v1.2)
 
 - Version 1.2.0 release series
-- Expanded feature documentation
+- Expanded feature documentation (feature_26 to feature_60+)
 - Additional utility scripts
 - Packaging and metadata improvements
 - Contribution and polish pass
 
-Over 100+ contributions across upgrade series.
+Over 40+ new contributions in the v1.2 upgrade series.
