@@ -4,12 +4,13 @@
 
 Uses real **ML-DSA-44** (FIPS 204) + **ML-KEM-512** (FIPS 203) + hybrid Ed25519 signatures.
 
-> Not production-ready. Clean, runnable prototype for learning. Version 1.1 upgrades.
+> Not production-ready. Clean, runnable prototype for learning. Version 1.2 upgrades.
 
 ## Version History
 
 | Version  | Focus                                                                    |
 | -------- | ------------------------------------------------------------------------ |
+| **v1.2** | More docs, utilities, packaging polish, contribution series              |
 | **v1.1** | Packaging, CI, Docker, more docs & polish                                |
 | **v1.0** | Docs, setup, tests, contribution polish                                  |
 | **v0.9** | CONTRACTS + EXPLORER — multi-sig, time-locks, send rules, Vexlore UI     |
@@ -48,14 +49,12 @@ Made by robin with love ❤️
 
 PRs welcome. See CONTRIBUTING.md.
 
-## Recent Upgrades (v1.1)
+## Recent Upgrades (v1.2)
 
-- Docker support
-- GitHub Actions CI
-- Modern packaging with pyproject.toml
-- Expanded documentation suite
-- Utility scripts
-- Additional tests
-- Version bump to 1.1.0
+- Version 1.2.0 release series
+- Expanded feature documentation
+- Additional utility scripts
+- Packaging and metadata improvements
+- Contribution and polish pass
 
-Over 70+ contributions in the upgrade series.
+Over 100+ contributions across upgrade series.

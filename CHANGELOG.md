@@ -1,5 +1,13 @@
 # Changelog
 
+## [v1.2] - 2026-11-06
+- Version bump to 1.2.0
+- Expanded upgrade notes and feature documentation
+- Additional utility scripts and contribution polish
+- Improved packaging metadata
+- More test coverage scaffolding
+- Educational post-quantum chain refinements
+
 ## [v1.1] - 2026-11-05
 - Added Dockerfile for containerized runs
 - Added GitHub Actions CI
