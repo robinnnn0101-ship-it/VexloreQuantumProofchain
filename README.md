@@ -4,12 +4,13 @@
 
 Uses real **ML-DSA-44** (FIPS 204) + **ML-KEM-512** (FIPS 203) + hybrid Ed25519 signatures.
 
-> Not production-ready. Clean, runnable prototype for learning. Version 1.2 upgrades.
+> Not production-ready. Clean, runnable prototype for learning. **Version 1.3 — more powerful upgrades.**
 
 ## Version History
 
 | Version  | Focus                                                                    |
 | -------- | ------------------------------------------------------------------------ |
+| **v1.3** | Enhanced power: faster difficulty, better PQ notes, utils, 75+ contribs |
 | **v1.2** | More docs, utilities, packaging polish, contribution series (40+)       |
 | **v1.1** | Packaging, CI, Docker, more docs & polish                                |
 | **v1.0** | Docs, setup, tests, contribution polish                                  |
@@ -39,22 +40,24 @@ Made by robin with love ❤️
 
 - Hybrid post-quantum signatures (ML-DSA-44 + Ed25519)
 - ML-KEM key encapsulation
-- Multi-node networking & gossip
+- Multi-node networking & gossip (improved efficiency in v1.3)
 - Multi-sig vaults & time-locks
 - Local explorer UI
 - Seed phrase wallets
-- Adaptive difficulty PoW
+- Adaptive difficulty PoW (faster retarget in v1.3)
+- Benchmark & stress utilities
 
 ## Contributing
 
 PRs welcome. See CONTRIBUTING.md.
 
-## Recent Upgrades (v1.2)
+## Recent Upgrades (v1.3)
 
-- Version 1.2.0 release series
-- Expanded feature documentation (feature_26 to feature_60+)
-- Additional utility scripts
-- Packaging and metadata improvements
-- Contribution and polish pass
+- Version 1.3.0 release — more powerful prototype
+- Expanded feature documentation (feature_61 to feature_140+)
+- New performance and benchmark utilities
+- Enhanced adaptive difficulty and networking notes
+- Contribution series (75+ new)
+- Packaging and CI refinements
 
-Over 40+ new contributions in the v1.2 upgrade series.
+Over 75+ new contributions in the v1.3 upgrade series.
